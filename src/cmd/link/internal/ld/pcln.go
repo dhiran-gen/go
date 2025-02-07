@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"internal/abi"
 	"internal/buildcfg"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -100,6 +99,19 @@ func makePclntab(ctxt *Link, container loader.Bitmap) (*pclntab, []*sym.Compilat
 }
 
 func emitPcln(ctxt *Link, s loader.Sym, container loader.Bitmap) bool {
+	if ctxt.Target.IsRISCV64() {
+		// Avoid adding local symbols to the pcln table - RISC-V
+		// linking generates a very large number of these, particularly
+		// for HI20 symbols (which we need to load in order to be able
+		// to resolve relocations). Unnecessarily including all of
+		// these symbols quickly blows out the size of the pcln table
+		// and overflows hash buckets.
+		symName := ctxt.loader.SymName(s)
+		if symName == "" || strings.HasPrefix(symName, ".L") {
+			return false
+		}
+	}
+
 	// We want to generate func table entries only for the "lowest
 	// level" symbols, not containers of subsymbols.
 	return !container.Has(s)
@@ -289,31 +301,11 @@ func walkFuncs(ctxt *Link, funcs []loader.Sym, f func(loader.Sym)) {
 func (state *pclntab) generateFuncnametab(ctxt *Link, funcs []loader.Sym) map[loader.Sym]uint32 {
 	nameOffsets := make(map[loader.Sym]uint32, state.nfunc)
 
-	// The name used by the runtime is the concatenation of the 3 returned strings.
-	// For regular functions, only one returned string is nonempty.
-	// For generic functions, we use three parts so that we can print everything
-	// within the outermost "[]" as "...".
-	nameParts := func(name string) (string, string, string) {
-		i := strings.IndexByte(name, '[')
-		if i < 0 {
-			return name, "", ""
-		}
-		j := strings.LastIndexByte(name, ']')
-		if j <= i {
-			return name, "", ""
-		}
-		return name[:i], "[...]", name[j+1:]
-	}
-
 	// Write the null terminated strings.
 	writeFuncNameTab := func(ctxt *Link, s loader.Sym) {
 		symtab := ctxt.loader.MakeSymbolUpdater(s)
 		for s, off := range nameOffsets {
-			a, b, c := nameParts(ctxt.loader.SymName(s))
-			o := int64(off)
-			o = symtab.AddStringAt(o, a)
-			o = symtab.AddStringAt(o, b)
-			_ = symtab.AddCStringAt(o, c)
+			symtab.AddCStringAt(int64(off), ctxt.loader.SymName(s))
 		}
 	}
 
@@ -321,8 +313,7 @@ func (state *pclntab) generateFuncnametab(ctxt *Link, funcs []loader.Sym) map[lo
 	var size int64
 	walkFuncs(ctxt, funcs, func(s loader.Sym) {
 		nameOffsets[s] = uint32(size)
-		a, b, c := nameParts(ctxt.loader.SymName(s))
-		size += int64(len(a) + len(b) + len(c) + 1) // NULL terminate
+		size += int64(len(ctxt.loader.SymName(s)) + 1) // NULL terminate
 	})
 
 	state.funcnametab = state.addGeneratedSym(ctxt, "runtime.funcnametab", size, writeFuncNameTab)
@@ -735,6 +726,17 @@ func writeFuncs(ctxt *Link, sb *loader.SymbolBuilder, funcs []loader.Sym, inlSym
 		for j := range funcdata {
 			dataoff := off + int64(4*j)
 			fdsym := funcdata[j]
+
+			// cmd/internal/obj optimistically populates ArgsPointerMaps and
+			// ArgInfo for assembly functions, hoping that the compiler will
+			// emit appropriate symbols from their Go stub declarations. If
+			// it didn't though, just ignore it.
+			//
+			// TODO(cherryyz): Fix arg map generation (see discussion on CL 523335).
+			if fdsym != 0 && (j == abi.FUNCDATA_ArgsPointerMaps || j == abi.FUNCDATA_ArgInfo) && ldr.IsFromAssembly(s) && ldr.Data(fdsym) == nil {
+				fdsym = 0
+			}
+
 			if fdsym == 0 {
 				sb.SetUint32(ctxt.Arch, dataoff, ^uint32(0)) // ^0 is a sentinel for "no value"
 				continue
@@ -805,18 +807,10 @@ func (ctxt *Link) pclntab(container loader.Bitmap) *pclntab {
 	return state
 }
 
-func gorootFinal() string {
-	root := buildcfg.GOROOT
-	if final := os.Getenv("GOROOT_FINAL"); final != "" {
-		root = final
-	}
-	return root
-}
-
 func expandGoroot(s string) string {
 	const n = len("$GOROOT")
 	if len(s) >= n+1 && s[:n] == "$GOROOT" && (s[n] == '/' || s[n] == '\\') {
-		if final := gorootFinal(); final != "" {
+		if final := buildcfg.GOROOT; final != "" {
 			return filepath.ToSlash(filepath.Join(final, s[n:]))
 		}
 	}
@@ -824,9 +818,8 @@ func expandGoroot(s string) string {
 }
 
 const (
-	BUCKETSIZE    = 256 * MINFUNC
 	SUBBUCKETS    = 16
-	SUBBUCKETSIZE = BUCKETSIZE / SUBBUCKETS
+	SUBBUCKETSIZE = abi.FuncTabBucketSize / SUBBUCKETS
 	NOIDX         = 0x7fffffff
 )
 
@@ -844,7 +837,7 @@ func (ctxt *Link) findfunctab(state *pclntab, container loader.Bitmap) {
 	// that map to that subbucket.
 	n := int32((max - min + SUBBUCKETSIZE - 1) / SUBBUCKETSIZE)
 
-	nbuckets := int32((max - min + BUCKETSIZE - 1) / BUCKETSIZE)
+	nbuckets := int32((max - min + abi.FuncTabBucketSize - 1) / abi.FuncTabBucketSize)
 
 	size := 4*int64(nbuckets) + int64(n)
 
@@ -875,7 +868,7 @@ func (ctxt *Link) findfunctab(state *pclntab, container loader.Bitmap) {
 				q = ldr.SymValue(e)
 			}
 
-			//print("%d: [%lld %lld] %s\n", idx, p, q, s->name);
+			//fmt.Printf("%d: [%x %x] %s\n", idx, p, q, ldr.SymName(s))
 			for ; p < q; p += SUBBUCKETSIZE {
 				i = int((p - min) / SUBBUCKETSIZE)
 				if indexes[i] > idx {
@@ -894,16 +887,16 @@ func (ctxt *Link) findfunctab(state *pclntab, container loader.Bitmap) {
 		for i := int32(0); i < nbuckets; i++ {
 			base := indexes[i*SUBBUCKETS]
 			if base == NOIDX {
-				Errorf(nil, "hole in findfunctab")
+				Errorf("hole in findfunctab")
 			}
 			t.SetUint32(ctxt.Arch, int64(i)*(4+SUBBUCKETS), uint32(base))
 			for j := int32(0); j < SUBBUCKETS && i*SUBBUCKETS+j < n; j++ {
 				idx = indexes[i*SUBBUCKETS+j]
 				if idx == NOIDX {
-					Errorf(nil, "hole in findfunctab")
+					Errorf("hole in findfunctab")
 				}
 				if idx-base >= 256 {
-					Errorf(nil, "too many functions in a findfunc bucket! %d/%d %d %d", i, nbuckets, j, idx-base)
+					Errorf("too many functions in a findfunc bucket! %d/%d %d %d", i, nbuckets, j, idx-base)
 				}
 
 				t.SetUint8(ctxt.Arch, int64(i)*(4+SUBBUCKETS)+4+int64(j), uint8(idx-base))

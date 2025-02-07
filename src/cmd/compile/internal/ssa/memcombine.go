@@ -8,7 +8,8 @@ import (
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/types"
 	"cmd/internal/src"
-	"sort"
+	"cmp"
+	"slices"
 )
 
 // memcombine combines smaller loads and stores into larger ones.
@@ -41,6 +42,7 @@ func memcombineLoads(f *Func) {
 		}
 	}
 	for _, b := range f.Blocks {
+		order = order[:0]
 		for _, v := range b.Values {
 			if v.Op != OpOr16 && v.Op != OpOr32 && v.Op != OpOr64 {
 				continue
@@ -141,27 +143,26 @@ func combineLoads(root *Value, n int64) bool {
 
 	// Find n values that are ORed together with the above op.
 	a := make([]*Value, 0, 8)
-	v := root
-	for int64(len(a)) < n {
-		if v.Args[0].Op == orOp {
-			a = append(a, v.Args[1])
-			v = v.Args[0]
-		} else if v.Args[1].Op == orOp {
-			a = append(a, v.Args[0])
-			v = v.Args[1]
-		} else if int64(len(a)) == n-2 {
-			a = append(a, v.Args[0])
-			a = append(a, v.Args[1])
-			v = nil
-		} else {
+	a = append(a, root)
+	for i := 0; i < len(a) && int64(len(a)) < n; i++ {
+		v := a[i]
+		if v.Uses != 1 && v != root {
+			// Something in this subtree is used somewhere else.
 			return false
 		}
+		if v.Op == orOp {
+			a[i] = v.Args[0]
+			a = append(a, v.Args[1])
+			i--
+		}
 	}
-	tail := v // Value to OR in beyond the ones we're working with (or nil if none).
+	if int64(len(a)) != n {
+		return false
+	}
 
 	// Check that the first entry to see what ops we're looking for.
 	// All the entries should be of the form shift(extend(load)), maybe with no shift.
-	v = a[0]
+	v := a[0]
 	if v.Op == shiftOp {
 		v = v.Args[0]
 	}
@@ -232,8 +233,8 @@ func combineLoads(root *Value, n int64) bool {
 	}
 
 	// Sort in memory address order.
-	sort.Slice(r, func(i, j int) bool {
-		return r[i].offset < r[j].offset
+	slices.SortFunc(r, func(a, b LoadRecord) int {
+		return cmp.Compare(a.offset, b.offset)
 	})
 
 	// Check that we have contiguous offsets.
@@ -313,19 +314,13 @@ func combineLoads(root *Value, n int64) bool {
 	if isLittleEndian && shift0 != 0 {
 		v = leftShift(loadBlock, pos, v, shift0)
 	}
-	if isBigEndian && shift0-(n-1)*8 != 0 {
-		v = leftShift(loadBlock, pos, v, shift0-(n-1)*8)
+	if isBigEndian && shift0-(n-1)*size*8 != 0 {
+		v = leftShift(loadBlock, pos, v, shift0-(n-1)*size*8)
 	}
 
-	// Install. If there's a tail, make the root (OR v tail).
-	// If not, do (Copy v).
-	if tail != nil {
-		root.SetArg(0, v)
-		root.SetArg(1, tail)
-	} else {
-		root.reset(OpCopy)
-		root.AddArg(v)
-	}
+	// Install with (Copy v).
+	root.reset(OpCopy)
+	root.AddArg(v)
 
 	// Clobber the loads, just to prevent additional work being done on
 	// subtrees (which are now unreachable).
@@ -506,6 +501,8 @@ func combineStores(root *Value, n int64) bool {
 			return false
 		}
 		if x.Aux.(*types.Type).Size() != size {
+			// TODO: the constant source and consecutive load source cases
+			// do not need all the stores to be the same size.
 			return false
 		}
 		base, off := splitPtr(x.Args[0])
@@ -516,10 +513,12 @@ func combineStores(root *Value, n int64) bool {
 	}
 	// Before we sort, grab the memory arg the result should have.
 	mem := a[n-1].store.Args[2]
+	// Also grab position of first store (last in array = first in memory order).
+	pos := a[n-1].store.Pos
 
 	// Sort stores in increasing address order.
-	sort.Slice(a, func(i, j int) bool {
-		return a[i].offset < a[j].offset
+	slices.SortFunc(a, func(sr1, sr2 StoreRecord) int {
+		return cmp.Compare(sr1.offset, sr2.offset)
 	})
 
 	// Check that everything is written to sequential locations.
@@ -536,7 +535,7 @@ func combineStores(root *Value, n int64) bool {
 	isConst := true
 	for i := int64(0); i < n; i++ {
 		switch a[i].store.Args[1].Op {
-		case OpConst32, OpConst16, OpConst8:
+		case OpConst32, OpConst16, OpConst8, OpConstBool:
 		default:
 			isConst = false
 			break
@@ -568,8 +567,78 @@ func combineStores(root *Value, n int64) bool {
 			v := a[i].store
 			if v == root {
 				v.Aux = cv.Type // widen store type
+				v.Pos = pos
 				v.SetArg(0, ptr)
 				v.SetArg(1, cv)
+				v.SetArg(2, mem)
+			} else {
+				clobber(v)
+				v.Type = types.Types[types.TBOOL] // erase memory type
+			}
+		}
+		return true
+	}
+
+	// Check for consecutive loads as the source of the stores.
+	var loadMem *Value
+	var loadBase BaseAddress
+	var loadIdx int64
+	for i := int64(0); i < n; i++ {
+		load := a[i].store.Args[1]
+		if load.Op != OpLoad {
+			loadMem = nil
+			break
+		}
+		if load.Uses != 1 {
+			loadMem = nil
+			break
+		}
+		if load.Type.IsPtr() {
+			// Don't combine stores containing a pointer, as we need
+			// a write barrier for those. This can't currently happen,
+			// but might in the future if we ever have another
+			// 8-byte-reg/4-byte-ptr architecture like amd64p32.
+			loadMem = nil
+			break
+		}
+		mem := load.Args[1]
+		base, idx := splitPtr(load.Args[0])
+		if loadMem == nil {
+			// First one we found
+			loadMem = mem
+			loadBase = base
+			loadIdx = idx
+			continue
+		}
+		if base != loadBase || mem != loadMem {
+			loadMem = nil
+			break
+		}
+		if idx != loadIdx+(a[i].offset-a[0].offset) {
+			loadMem = nil
+			break
+		}
+	}
+	if loadMem != nil {
+		// Modify the first load to do a larger load instead.
+		load := a[0].store.Args[1]
+		switch size * n {
+		case 2:
+			load.Type = types.Types[types.TUINT16]
+		case 4:
+			load.Type = types.Types[types.TUINT32]
+		case 8:
+			load.Type = types.Types[types.TUINT64]
+		}
+
+		// Modify root to do the store.
+		for i := int64(0); i < n; i++ {
+			v := a[i].store
+			if v == root {
+				v.Aux = load.Type // widen store type
+				v.Pos = pos
+				v.SetArg(0, ptr)
+				v.SetArg(1, load)
 				v.SetArg(2, mem)
 			} else {
 				clobber(v)
@@ -594,14 +663,14 @@ func combineStores(root *Value, n int64) bool {
 	isLittleEndian := true
 	shift0 := shift(a[0].store, shiftBase)
 	for i := int64(1); i < n; i++ {
-		if shift(a[i].store, shiftBase) != shift0+i*8 {
+		if shift(a[i].store, shiftBase) != shift0+i*size*8 {
 			isLittleEndian = false
 			break
 		}
 	}
 	isBigEndian := true
 	for i := int64(1); i < n; i++ {
-		if shift(a[i].store, shiftBase) != shift0-i*8 {
+		if shift(a[i].store, shiftBase) != shift0-i*size*8 {
 			isBigEndian = false
 			break
 		}
@@ -624,8 +693,8 @@ func combineStores(root *Value, n int64) bool {
 	if isLittleEndian && shift0 != 0 {
 		sv = rightShift(root.Block, root.Pos, sv, shift0)
 	}
-	if isBigEndian && shift0-(n-1)*8 != 0 {
-		sv = rightShift(root.Block, root.Pos, sv, shift0-(n-1)*8)
+	if isBigEndian && shift0-(n-1)*size*8 != 0 {
+		sv = rightShift(root.Block, root.Pos, sv, shift0-(n-1)*size*8)
 	}
 	if sv.Type.Size() > size*n {
 		sv = truncate(root.Block, root.Pos, sv, sv.Type.Size(), size*n)
@@ -639,6 +708,7 @@ func combineStores(root *Value, n int64) bool {
 		v := a[i].store
 		if v == root {
 			v.Aux = sv.Type // widen store type
+			v.Pos = pos
 			v.SetArg(0, ptr)
 			v.SetArg(1, sv)
 			v.SetArg(2, mem)

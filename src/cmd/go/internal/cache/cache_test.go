@@ -20,12 +20,8 @@ func init() {
 }
 
 func TestBasic(t *testing.T) {
-	dir, err := os.MkdirTemp("", "cachetest-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-	_, err = Open(filepath.Join(dir, "notexist"))
+	dir := t.TempDir()
+	_, err := Open(filepath.Join(dir, "notexist"))
 	if err == nil {
 		t.Fatal(`Open("tmp/notexist") succeeded, want failure`)
 	}
@@ -65,13 +61,7 @@ func TestBasic(t *testing.T) {
 }
 
 func TestGrowth(t *testing.T) {
-	dir, err := os.MkdirTemp("", "cachetest-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-
-	c, err := Open(dir)
+	c, err := Open(t.TempDir())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -118,19 +108,13 @@ func TestVerifyPanic(t *testing.T) {
 		t.Fatal("initEnv did not set verify")
 	}
 
-	dir, err := os.MkdirTemp("", "cachetest-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-
-	c, err := Open(dir)
+	c, err := Open(t.TempDir())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 
 	id := ActionID(dummyID(1))
-	if err := c.PutBytes(id, []byte("abc")); err != nil {
+	if err := PutBytes(c, id, []byte("abc")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -140,7 +124,7 @@ func TestVerifyPanic(t *testing.T) {
 			return
 		}
 	}()
-	c.PutBytes(id, []byte("def"))
+	PutBytes(c, id, []byte("def"))
 	t.Fatal("mismatched Put did not panic in verify mode")
 }
 
@@ -151,12 +135,7 @@ func dummyID(x int) [HashSize]byte {
 }
 
 func TestCacheTrim(t *testing.T) {
-	dir, err := os.MkdirTemp("", "cachetest-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-
+	dir := t.TempDir()
 	c, err := Open(dir)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -178,9 +157,9 @@ func TestCacheTrim(t *testing.T) {
 	}
 
 	id := ActionID(dummyID(1))
-	c.PutBytes(id, []byte("abc"))
+	PutBytes(c, id, []byte("abc"))
 	entry, _ := c.Get(id)
-	c.PutBytes(ActionID(dummyID(2)), []byte("def"))
+	PutBytes(c, ActionID(dummyID(2)), []byte("def"))
 	mtime := now
 	checkTime(fmt.Sprintf("%x-a", id), mtime)
 	checkTime(fmt.Sprintf("%x-d", entry.OutputID), mtime)

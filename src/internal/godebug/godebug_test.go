@@ -5,8 +5,15 @@
 package godebug_test
 
 import (
+	"fmt"
 	. "internal/godebug"
+	"internal/race"
+	"internal/testenv"
+	"os"
+	"os/exec"
 	"runtime/metrics"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -60,5 +67,98 @@ func TestMetrics(t *testing.T) {
 	}
 	if count := m[0].Value.Uint64(); count != 3 {
 		t.Fatalf("NonDefault value = %d, want 3", count)
+	}
+}
+
+// TestPanicNilRace checks for a race in the runtime caused by use of runtime
+// atomics (not visible to usual race detection) to install the counter for
+// non-default panic(nil) semantics.  For #64649.
+func TestPanicNilRace(t *testing.T) {
+	if !race.Enabled {
+		t.Skip("Skipping test intended for use with -race.")
+	}
+	if os.Getenv("GODEBUG") != "panicnil=1" {
+		cmd := testenv.CleanCmdEnv(testenv.Command(t, os.Args[0], "-test.run=^TestPanicNilRace$", "-test.v", "-test.parallel=2", "-test.count=1"))
+		cmd.Env = append(cmd.Env, "GODEBUG=panicnil=1")
+		out, err := cmd.CombinedOutput()
+		t.Logf("output:\n%s", out)
+
+		if err != nil {
+			t.Errorf("Was not expecting a crash")
+		}
+		return
+	}
+
+	test := func(t *testing.T) {
+		t.Parallel()
+		defer func() {
+			recover()
+		}()
+		panic(nil)
+	}
+	t.Run("One", test)
+	t.Run("Two", test)
+}
+
+func TestCmdBisect(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+	out, err := exec.Command("go", "run", "cmd/vendor/golang.org/x/tools/cmd/bisect", "GODEBUG=buggy=1#PATTERN", os.Args[0], "-test.run=^TestBisectTestCase$").CombinedOutput()
+	if err != nil {
+		t.Fatalf("exec bisect: %v\n%s", err, out)
+	}
+
+	var want []string
+	src, err := os.ReadFile("godebug_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, line := range strings.Split(string(src), "\n") {
+		if strings.Contains(line, "BISECT"+" "+"BUG") {
+			want = append(want, fmt.Sprintf("godebug_test.go:%d", i+1))
+		}
+	}
+	slices.Sort(want)
+
+	var have []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.Contains(line, "godebug_test.go:") {
+			have = append(have, line[strings.LastIndex(line, "godebug_test.go:"):])
+		}
+	}
+	slices.Sort(have)
+
+	if !slices.Equal(have, want) {
+		t.Errorf("bad bisect output:\nhave %v\nwant %v\ncomplete output:\n%s", have, want, string(out))
+	}
+}
+
+// This test does nothing by itself, but you can run
+//
+//	bisect 'GODEBUG=buggy=1#PATTERN' go test -run='^TestBisectTestCase$'
+//
+// to see that the GODEBUG bisect support is working.
+// TestCmdBisect above does exactly that.
+func TestBisectTestCase(t *testing.T) {
+	s := New("#buggy")
+	for i := 0; i < 10; i++ {
+		a := s.Value() == "1"
+		b := s.Value() == "1"
+		c := s.Value() == "1" // BISECT BUG
+		d := s.Value() == "1" // BISECT BUG
+		e := s.Value() == "1" // BISECT BUG
+
+		if a {
+			t.Log("ok")
+		}
+		if b {
+			t.Log("ok")
+		}
+		if c {
+			t.Error("bug")
+		}
+		if d &&
+			e {
+			t.Error("bug")
+		}
 	}
 }

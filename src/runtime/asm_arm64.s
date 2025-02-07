@@ -96,8 +96,9 @@ nocgo:
 	// start this M
 	BL	runtime·mstart(SB)
 
-	// Prevent dead-code elimination of debugCallV2, which is
+	// Prevent dead-code elimination of debugCallV2 and debugPinnerV1, which are
 	// intended to be called by debuggers.
+	MOVD	$runtime·debugPinnerV1<ABIInternal>(SB), R0
 	MOVD	$runtime·debugCallV2<ABIInternal>(SB), R0
 
 	MOVD	$0, R0
@@ -262,6 +263,30 @@ noswitch:
 	SUB	$8, RSP, R29	// restore FP
 	B	(R3)
 
+// func switchToCrashStack0(fn func())
+TEXT runtime·switchToCrashStack0<ABIInternal>(SB), NOSPLIT, $0-8
+	MOVD	R0, R26    // context register
+	MOVD	g_m(g), R1 // curm
+
+	// set g to gcrash
+	MOVD	$runtime·gcrash(SB), g // g = &gcrash
+	BL	runtime·save_g(SB)         // clobbers R0
+	MOVD	R1, g_m(g)             // g.m = curm
+	MOVD	g, m_g0(R1)            // curm.g0 = g
+
+	// switch to crashstack
+	MOVD	(g_stack+stack_hi)(g), R1
+	SUB	$(4*8), R1
+	MOVD	R1, RSP
+
+	// call target function
+	MOVD	0(R26), R0
+	CALL	(R0)
+
+	// should never return
+	CALL	runtime·abort(SB)
+	UNDEF
+
 /*
  * support for morestack
  */
@@ -278,6 +303,16 @@ TEXT runtime·morestack(SB),NOSPLIT|NOFRAME,$0-0
 	// Cannot grow scheduler stack (m->g0).
 	MOVD	g_m(g), R8
 	MOVD	m_g0(R8), R4
+
+	// Called from f.
+	// Set g->sched to context in f
+	MOVD	RSP, R0
+	MOVD	R0, (g_sched+gobuf_sp)(g)
+	MOVD	R29, (g_sched+gobuf_bp)(g)
+	MOVD	LR, (g_sched+gobuf_pc)(g)
+	MOVD	R3, (g_sched+gobuf_lr)(g)
+	MOVD	R26, (g_sched+gobuf_ctxt)(g)
+
 	CMP	g, R4
 	BNE	3(PC)
 	BL	runtime·badmorestackg0(SB)
@@ -289,15 +324,6 @@ TEXT runtime·morestack(SB),NOSPLIT|NOFRAME,$0-0
 	BNE	3(PC)
 	BL	runtime·badmorestackgsignal(SB)
 	B	runtime·abort(SB)
-
-	// Called from f.
-	// Set g->sched to context in f
-	MOVD	RSP, R0
-	MOVD	R0, (g_sched+gobuf_sp)(g)
-	MOVD	R29, (g_sched+gobuf_bp)(g)
-	MOVD	LR, (g_sched+gobuf_pc)(g)
-	MOVD	R3, (g_sched+gobuf_lr)(g)
-	MOVD	R26, (g_sched+gobuf_ctxt)(g)
 
 	// Called from f.
 	// Set m->morebuf to f's callers.
@@ -1015,10 +1041,20 @@ nosave:
 TEXT ·cgocallback(SB),NOSPLIT,$24-24
 	NO_LOCAL_POINTERS
 
+	// Skip cgocallbackg, just dropm when fn is nil, and frame is the saved g.
+	// It is used to dropm while thread is exiting.
+	MOVD	fn+0(FP), R1
+	CBNZ	R1, loadg
+	// Restore the g from frame.
+	MOVD	frame+8(FP), g
+	B	dropm
+
+loadg:
 	// Load g from thread-local storage.
 	BL	runtime·load_g(SB)
 
-	// If g is nil, Go did not create the current thread.
+	// If g is nil, Go did not create the current thread,
+	// or if this thread never called into Go on pthread platforms.
 	// Call needm to obtain one for temporary use.
 	// In this case, we're running on the thread stack, so there's
 	// lots of space, but the linker doesn't know. Hide the call from
@@ -1031,7 +1067,7 @@ TEXT ·cgocallback(SB),NOSPLIT,$24-24
 
 needm:
 	MOVD	g, savedm-8(SP) // g is zero, so is m.
-	MOVD	$runtime·needm(SB), R0
+	MOVD	$runtime·needAndBindM(SB), R0
 	BL	(R0)
 
 	// Set m->g0->sched.sp = SP, so that if a panic happens
@@ -1112,10 +1148,24 @@ havem:
 	MOVD	savedsp-16(SP), R4
 	MOVD	R4, (g_sched+gobuf_sp)(g)
 
-	// If the m on entry was nil, we called needm above to borrow an m
-	// for the duration of the call. Since the call is over, return it with dropm.
+	// If the m on entry was nil, we called needm above to borrow an m,
+	// 1. for the duration of the call on non-pthread platforms,
+	// 2. or the duration of the C thread alive on pthread platforms.
+	// If the m on entry wasn't nil,
+	// 1. the thread might be a Go thread,
+	// 2. or it wasn't the first call from a C thread on pthread platforms,
+	//    since then we skip dropm to reuse the m in the first call.
 	MOVD	savedm-8(SP), R6
 	CBNZ	R6, droppedm
+
+	// Skip dropm to reuse it in the next call, when a pthread key has been created.
+	MOVD	_cgo_pthread_key_created(SB), R6
+	// It means cgo is disabled when _cgo_pthread_key_created is a nil pointer, need dropm.
+	CBZ	R6, dropm
+	MOVD	(R6), R6
+	CBNZ	R6, droppedm
+
+dropm:
 	MOVD	$runtime·dropm(SB), R0
 	BL	(R0)
 droppedm:
@@ -1544,6 +1594,6 @@ TEXT runtime·panicSliceConvert<ABIInternal>(SB),NOSPLIT,$0-16
 	MOVD	R3, R1
 	JMP	runtime·goPanicSliceConvert<ABIInternal>(SB)
 
-TEXT ·getcallerfp<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
+TEXT ·getfp<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
 	MOVD R29, R0
 	RET

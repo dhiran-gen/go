@@ -6,6 +6,8 @@ package testenv
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
@@ -16,27 +18,35 @@ import (
 	"time"
 )
 
-// HasExec reports whether the current system can start new processes
+// MustHaveExec checks that the current system can start new processes
 // using os.StartProcess or (more commonly) exec.Command.
-func HasExec() bool {
-	tryExecOnce.Do(func() {
-		tryExecOk = tryExec()
-	})
-	return tryExecOk
+// If not, MustHaveExec calls t.Skip with an explanation.
+//
+// On some platforms MustHaveExec checks for exec support by re-executing the
+// current executable, which must be a binary built by 'go test'.
+// We intentionally do not provide a HasExec function because of the risk of
+// inappropriate recursion in TestMain functions.
+//
+// To check for exec support outside of a test, just try to exec the command.
+// If exec is not supported, testenv.SyscallIsNotSupported will return true
+// for the resulting error.
+func MustHaveExec(t testing.TB) {
+	if err := tryExec(); err != nil {
+		msg := fmt.Sprintf("cannot exec subprocess on %s/%s: %v", runtime.GOOS, runtime.GOARCH, err)
+		if t == nil {
+			panic(msg)
+		}
+		t.Helper()
+		t.Skip("skipping test:", msg)
+	}
 }
 
-var (
-	tryExec     = func() bool { return true }
-	tryExecOnce sync.Once
-	tryExecOk   bool
-)
-
-func init() {
+var tryExec = sync.OnceValue(func() error {
 	switch runtime.GOOS {
 	case "wasip1", "js", "ios":
 	default:
 		// Assume that exec always works on non-mobile platforms and Android.
-		return
+		return nil
 	}
 
 	// ios has an exec syscall but on real iOS devices it might return a
@@ -52,42 +62,41 @@ func init() {
 		// This isn't a standard 'go test' binary, so we don't know how to
 		// self-exec in a way that should succeed without side effects.
 		// Just forget it.
-		tryExec = func() bool { return false }
-		return
+		return errors.New("can't probe for exec support with a non-test executable")
 	}
 
-	// We know that this is a test executable.
-	// We should be able to run it with a no-op flag and the original test
-	// execution environment to check for overall exec support.
-
-	// Save the original environment during init for use in the check. A test
-	// binary may modify its environment before calling HasExec to change its
-	// behavior// (such as mimicking a command-line tool), and that modified
-	// environment might cause our self-test to behave unpredictably.
-	origEnv := os.Environ()
-
-	tryExec = func() bool {
-		exe, err := os.Executable()
-		if err != nil {
-			return false
-		}
-		cmd := exec.Command(exe, "-test.list=^$")
-		cmd.Env = origEnv
-		if err := cmd.Run(); err == nil {
-			tryExecOk = true
-		}
-		return false
+	// We know that this is a test executable. We should be able to run it with a
+	// no-op flag to check for overall exec support.
+	exe, err := exePath()
+	if err != nil {
+		return fmt.Errorf("can't probe for exec support: %w", err)
 	}
+	cmd := exec.Command(exe, "-test.list=^$")
+	cmd.Env = origEnv
+	return cmd.Run()
+})
+
+// Executable is a wrapper around [MustHaveExec] and [os.Executable].
+// It returns the path name for the executable that started the current process,
+// or skips the test if the current system can't start new processes,
+// or fails the test if the path can not be obtained.
+func Executable(t testing.TB) string {
+	MustHaveExec(t)
+
+	exe, err := exePath()
+	if err != nil {
+		msg := fmt.Sprintf("os.Executable error: %v", err)
+		if t == nil {
+			panic(msg)
+		}
+		t.Fatal(msg)
+	}
+	return exe
 }
 
-// MustHaveExec checks that the current system can start new processes
-// using os.StartProcess or (more commonly) exec.Command.
-// If not, MustHaveExec calls t.Skip with an explanation.
-func MustHaveExec(t testing.TB) {
-	if !HasExec() {
-		t.Skipf("skipping test: cannot exec subprocess on %s/%s", runtime.GOOS, runtime.GOARCH)
-	}
-}
+var exePath = sync.OnceValues(func() (string, error) {
+	return os.Executable()
+})
 
 var execPaths sync.Map // path -> error
 
@@ -103,6 +112,7 @@ func MustHaveExecPath(t testing.TB, path string) {
 		err, _ = execPaths.LoadOrStore(path, err)
 	}
 	if err != nil {
+		t.Helper()
 		t.Skipf("skipping test: %s: %s", path, err)
 	}
 }
@@ -110,11 +120,14 @@ func MustHaveExecPath(t testing.TB, path string) {
 // CleanCmdEnv will fill cmd.Env with the environment, excluding certain
 // variables that could modify the behavior of the Go tools such as
 // GODEBUG and GOTRACEBACK.
+//
+// If the caller wants to set cmd.Dir, set it before calling this function,
+// so PWD will be set correctly in the environment.
 func CleanCmdEnv(cmd *exec.Cmd) *exec.Cmd {
 	if cmd.Env != nil {
 		panic("environment already set")
 	}
-	for _, env := range os.Environ() {
+	for _, env := range cmd.Environ() {
 		// Exclude GODEBUG from the environment to prevent its output
 		// from breaking tests that are trying to parse other command output.
 		if strings.HasPrefix(env, "GODEBUG=") {
@@ -173,8 +186,8 @@ func CommandContext(t testing.TB, ctx context.Context, name string, args ...stri
 			// grace periods to clean up: one for the delay between the first
 			// termination signal being sent (via the Cancel callback when the Context
 			// expires) and the process being forcibly terminated (via the WaitDelay
-			// field), and a second one for the delay becween the process being
-			// terminated and and the test logging its output for debugging.
+			// field), and a second one for the delay between the process being
+			// terminated and the test logging its output for debugging.
 			//
 			// (We want to ensure that the test process itself has enough time to
 			// log the output before it is also terminated.)

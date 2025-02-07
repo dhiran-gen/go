@@ -398,6 +398,35 @@ bad:
 	CALL	AX
 	INT	$3
 
+// func switchToCrashStack0(fn func())
+TEXT runtime·switchToCrashStack0(SB), NOSPLIT, $0-4
+	MOVL 	fn+0(FP), AX
+
+	get_tls(CX)
+	MOVL	g(CX), BX	// BX = g
+	MOVL	g_m(BX), DX	// DX = curm
+
+	// set g to gcrash
+	LEAL	runtime·gcrash(SB), BX // g = &gcrash
+	MOVL	DX, g_m(BX)            // g.m = curm
+	MOVL	BX, m_g0(DX)           // curm.g0 = g
+	get_tls(CX)
+	MOVL	BX, g(CX)
+
+	// switch to crashstack
+	MOVL	(g_stack+stack_hi)(BX), DX
+	SUBL	$(4*8), DX
+	MOVL	DX, SP
+
+	// call target function
+	MOVL	AX, DX
+	MOVL	0(AX), AX
+	CALL	AX
+
+	// should never return
+	CALL	runtime·abort(SB)
+	UNDEF
+
 /*
  * support for morestack
  */
@@ -408,11 +437,19 @@ bad:
 // the top of a stack (for example, morestack calling newstack
 // calling the scheduler calling newm calling gc), so we must
 // record an argument size. For that purpose, it has no arguments.
-TEXT runtime·morestack(SB),NOSPLIT,$0-0
+TEXT runtime·morestack(SB),NOSPLIT|NOFRAME,$0-0
 	// Cannot grow scheduler stack (m->g0).
 	get_tls(CX)
-	MOVL	g(CX), BX
-	MOVL	g_m(BX), BX
+	MOVL	g(CX), DI
+	MOVL	g_m(DI), BX
+
+	// Set g->sched to context in f.
+	MOVL	0(SP), AX	// f's PC
+	MOVL	AX, (g_sched+gobuf_pc)(DI)
+	LEAL	4(SP), AX	// f's SP
+	MOVL	AX, (g_sched+gobuf_sp)(DI)
+	MOVL	DX, (g_sched+gobuf_ctxt)(DI)
+
 	MOVL	m_g0(BX), SI
 	CMPL	g(CX), SI
 	JNE	3(PC)
@@ -436,13 +473,6 @@ TEXT runtime·morestack(SB),NOSPLIT,$0-0
 	get_tls(CX)
 	MOVL	g(CX), SI
 	MOVL	SI, (m_morebuf+gobuf_g)(BX)
-
-	// Set g->sched to context in f.
-	MOVL	0(SP), AX	// f's PC
-	MOVL	AX, (g_sched+gobuf_pc)(SI)
-	LEAL	4(SP), AX	// f's SP
-	MOVL	AX, (g_sched+gobuf_sp)(SI)
-	MOVL	DX, (g_sched+gobuf_ctxt)(SI)
 
 	// Call newstack on m->g0's stack.
 	MOVL	m_g0(BX), BP
@@ -689,7 +719,20 @@ nosave:
 TEXT ·cgocallback(SB),NOSPLIT,$12-12  // Frame size must match commented places below
 	NO_LOCAL_POINTERS
 
-	// If g is nil, Go did not create the current thread.
+	// Skip cgocallbackg, just dropm when fn is nil, and frame is the saved g.
+	// It is used to dropm while thread is exiting.
+	MOVL	fn+0(FP), AX
+	CMPL	AX, $0
+	JNE	loadg
+	// Restore the g from frame.
+	get_tls(CX)
+	MOVL	frame+4(FP), BX
+	MOVL	BX, g(CX)
+	JMP	dropm
+
+loadg:
+	// If g is nil, Go did not create the current thread,
+	// or if this thread never called into Go on pthread platforms.
 	// Call needm to obtain one for temporary use.
 	// In this case, we're running on the thread stack, so there's
 	// lots of space, but the linker doesn't know. Hide the call from
@@ -707,9 +750,9 @@ TEXT ·cgocallback(SB),NOSPLIT,$12-12  // Frame size must match commented places
 	MOVL	BP, savedm-4(SP) // saved copy of oldm
 	JMP	havem
 needm:
-	MOVL	$runtime·needm(SB), AX
+	MOVL	$runtime·needAndBindM(SB), AX
 	CALL	AX
-	MOVL	$0, savedm-4(SP) // dropm on return
+	MOVL	$0, savedm-4(SP)
 	get_tls(CX)
 	MOVL	g(CX), BP
 	MOVL	g_m(BP), BP
@@ -784,13 +827,29 @@ havem:
 	MOVL	0(SP), AX
 	MOVL	AX, (g_sched+gobuf_sp)(SI)
 
-	// If the m on entry was nil, we called needm above to borrow an m
-	// for the duration of the call. Since the call is over, return it with dropm.
+	// If the m on entry was nil, we called needm above to borrow an m,
+	// 1. for the duration of the call on non-pthread platforms,
+	// 2. or the duration of the C thread alive on pthread platforms.
+	// If the m on entry wasn't nil,
+	// 1. the thread might be a Go thread,
+	// 2. or it wasn't the first call from a C thread on pthread platforms,
+	//    since then we skip dropm to reuse the m in the first call.
 	MOVL	savedm-4(SP), DX
 	CMPL	DX, $0
-	JNE 3(PC)
+	JNE	droppedm
+
+	// Skip dropm to reuse it in the next call, when a pthread key has been created.
+	MOVL	_cgo_pthread_key_created(SB), DX
+	// It means cgo is disabled when _cgo_pthread_key_created is a nil pointer, need dropm.
+	CMPL	DX, $0
+	JEQ	dropm
+	CMPL	(DX), $0
+	JNE	droppedm
+
+dropm:
 	MOVL	$runtime·dropm(SB), AX
 	CALL	AX
+droppedm:
 
 	// Done!
 	RET

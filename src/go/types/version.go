@@ -5,122 +5,62 @@
 package types
 
 import (
-	"errors"
-	"go/ast"
-	"go/token"
-	. "internal/types/errors"
-	"strings"
+	"fmt"
+	"go/version"
+	"internal/goversion"
 )
 
-// langCompat reports an error if the representation of a numeric
-// literal is not compatible with the current language version.
-func (check *Checker) langCompat(lit *ast.BasicLit) {
-	s := lit.Value
-	if len(s) <= 2 || check.allowVersion(check.pkg, lit.Pos(), 1, 13) {
-		return
-	}
-	// len(s) > 2
-	if strings.Contains(s, "_") {
-		check.error(lit, UnsupportedFeature, "underscores in numeric literals requires go1.13 or later")
-		return
-	}
-	if s[0] != '0' {
-		return
-	}
-	radix := s[1]
-	if radix == 'b' || radix == 'B' {
-		check.error(lit, UnsupportedFeature, "binary literals requires go1.13 or later")
-		return
-	}
-	if radix == 'o' || radix == 'O' {
-		check.error(lit, UnsupportedFeature, "0o/0O-style octal literals requires go1.13 or later")
-		return
-	}
-	if lit.Kind != token.INT && (radix == 'x' || radix == 'X') {
-		check.error(lit, UnsupportedFeature, "hexadecimal floating-point literals requires go1.13 or later")
-	}
+// A goVersion is a Go language version string of the form "go1.%d"
+// where d is the minor version number. goVersion strings don't
+// contain release numbers ("go1.20.1" is not a valid goVersion).
+type goVersion string
+
+// asGoVersion returns v as a goVersion (e.g., "go1.20.1" becomes "go1.20").
+// If v is not a valid Go version, the result is the empty string.
+func asGoVersion(v string) goVersion {
+	return goVersion(version.Lang(v))
 }
 
-// allowVersion reports whether the given package
-// is allowed to use version major.minor.
-func (check *Checker) allowVersion(pkg *Package, pos token.Pos, major, minor int) bool {
-	// We assume that imported packages have all been checked,
-	// so we only have to check for the local package.
-	if pkg != check.pkg {
-		return true
-	}
-
-	// If the source file declares its Go version, use that to decide.
-	if check.posVers != nil {
-		if v, ok := check.posVers[check.fset.File(pos)]; ok && v.major >= 1 {
-			return v.major > major || v.major == major && v.minor >= minor
-		}
-	}
-
-	// Otherwise fall back to the version in the checker.
-	ma, mi := check.version.major, check.version.minor
-	return ma == 0 && mi == 0 || ma > major || ma == major && mi >= minor
+// isValid reports whether v is a valid Go version.
+func (v goVersion) isValid() bool {
+	return v != ""
 }
 
-type version struct {
-	major, minor int
+// cmp returns -1, 0, or +1 depending on whether x < y, x == y, or x > y,
+// interpreted as Go versions.
+func (x goVersion) cmp(y goVersion) int {
+	return version.Compare(string(x), string(y))
 }
 
-var errVersionSyntax = errors.New("invalid Go version syntax")
+var (
+	// Go versions that introduced language changes
+	go1_9  = asGoVersion("go1.9")
+	go1_13 = asGoVersion("go1.13")
+	go1_14 = asGoVersion("go1.14")
+	go1_17 = asGoVersion("go1.17")
+	go1_18 = asGoVersion("go1.18")
+	go1_20 = asGoVersion("go1.20")
+	go1_21 = asGoVersion("go1.21")
+	go1_22 = asGoVersion("go1.22")
+	go1_23 = asGoVersion("go1.23")
 
-// parseGoVersion parses a Go version string (such as "go1.12")
-// and returns the version, or an error. If s is the empty
-// string, the version is 0.0.
-func parseGoVersion(s string) (v version, err error) {
-	if s == "" {
-		return
-	}
-	if !strings.HasPrefix(s, "go") {
-		return version{}, errVersionSyntax
-	}
-	s = s[len("go"):]
-	i := 0
-	for ; i < len(s) && '0' <= s[i] && s[i] <= '9'; i++ {
-		if i >= 10 || i == 0 && s[i] == '0' {
-			return version{}, errVersionSyntax
-		}
-		v.major = 10*v.major + int(s[i]) - '0'
-	}
-	if i > 0 && i == len(s) {
-		return
-	}
-	if i == 0 || s[i] != '.' {
-		return version{}, errVersionSyntax
-	}
-	s = s[i+1:]
-	if s == "0" {
-		// We really should not accept "go1.0",
-		// but we didn't reject it from the start
-		// and there are now programs that use it.
-		// So accept it.
-		return
-	}
-	i = 0
-	for ; i < len(s) && '0' <= s[i] && s[i] <= '9'; i++ {
-		if i >= 10 || i == 0 && s[i] == '0' {
-			return version{}, errVersionSyntax
-		}
-		v.minor = 10*v.minor + int(s[i]) - '0'
-	}
-	if i > 0 && i == len(s) {
-		return
-	}
-	return version{}, errVersionSyntax
+	// current (deployed) Go version
+	go_current = asGoVersion(fmt.Sprintf("go1.%d", goversion.Version))
+)
+
+// allowVersion reports whether the current effective Go version
+// (which may vary from one file to another) is allowed to use the
+// feature version (want).
+func (check *Checker) allowVersion(want goVersion) bool {
+	return !check.version.isValid() || check.version.cmp(want) >= 0
 }
 
-func (v version) equal(u version) bool {
-	return v.major == u.major && v.minor == u.minor
-}
-
-func (v version) before(u version) bool {
-	return v.major < u.major || v.major == u.major && v.minor < u.minor
-}
-
-func (v version) after(u version) bool {
-	return v.major > u.major || v.major == u.major && v.minor > u.minor
+// verifyVersionf is like allowVersion but also accepts a format string and arguments
+// which are used to report a version error if allowVersion returns false.
+func (check *Checker) verifyVersionf(at positioner, v goVersion, format string, args ...interface{}) bool {
+	if !check.allowVersion(v) {
+		check.versionErrorf(at, v, format, args...)
+		return false
+	}
+	return true
 }

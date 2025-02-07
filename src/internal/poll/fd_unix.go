@@ -7,6 +7,7 @@
 package poll
 
 import (
+	"internal/itoa"
 	"internal/syscall/unix"
 	"io"
 	"sync/atomic"
@@ -52,6 +53,8 @@ type FD struct {
 // or "file".
 // Set pollable to true if fd should be managed by runtime netpoll.
 func (fd *FD) Init(net string, pollable bool) error {
+	fd.SysFile.init()
+
 	// We don't actually care about the various network types.
 	if net == "file" {
 		fd.isFile = true
@@ -76,12 +79,7 @@ func (fd *FD) destroy() error {
 	// so this must be executed before CloseFunc.
 	fd.pd.close()
 
-	// We don't use ignoringEINTR here because POSIX does not define
-	// whether the descriptor is closed if close returns EINTR.
-	// If the descriptor is indeed closed, using a loop would race
-	// with some other goroutine opening a new descriptor.
-	// (The Linux kernel guarantees that it is closed on an EINTR error.)
-	err := CloseFunc(fd.Sysfd)
+	err := fd.SysFile.destroy(fd.Sysfd)
 
 	fd.Sysfd = -1
 	runtime_Semrelease(&fd.csema)
@@ -185,16 +183,9 @@ func (fd *FD) Pread(p []byte, off int64) (int, error) {
 	if fd.IsStream && len(p) > maxRW {
 		p = p[:maxRW]
 	}
-	var (
-		n   int
-		err error
-	)
-	for {
-		n, err = syscall.Pread(fd.Sysfd, p, off)
-		if err != syscall.EINTR {
-			break
-		}
-	}
+	n, err := ignoringEINTR2(func() (int, error) {
+		return syscall.Pread(fd.Sysfd, p, off)
+	})
 	if err != nil {
 		n = 0
 	}
@@ -382,6 +373,14 @@ func (fd *FD) Write(p []byte) (int, error) {
 		}
 		n, err := ignoringEINTRIO(syscall.Write, fd.Sysfd, p[nn:max])
 		if n > 0 {
+			if n > max-nn {
+				// This can reportedly happen when using
+				// some VPN software. Issue #61060.
+				// If we don't check this we will panic
+				// with slice bounds out of range.
+				// Use a more informative panic.
+				panic("invalid return from write: got " + itoa.Itoa(n) + " from a write of " + itoa.Itoa(max-nn))
+			}
 			nn += n
 		}
 		if nn == len(p) {
@@ -653,18 +652,18 @@ var dupCloexecUnsupported atomic.Bool
 // DupCloseOnExec dups fd and marks it close-on-exec.
 func DupCloseOnExec(fd int) (int, string, error) {
 	if syscall.F_DUPFD_CLOEXEC != 0 && !dupCloexecUnsupported.Load() {
-		r0, e1 := fcntl(fd, syscall.F_DUPFD_CLOEXEC, 0)
-		if e1 == nil {
+		r0, err := unix.Fcntl(fd, syscall.F_DUPFD_CLOEXEC, 0)
+		if err == nil {
 			return r0, "", nil
 		}
-		switch e1.(syscall.Errno) {
+		switch err {
 		case syscall.EINVAL, syscall.ENOSYS:
 			// Old kernel, or js/wasm (which returns
 			// ENOSYS). Fall back to the portable way from
 			// now on.
 			dupCloexecUnsupported.Store(true)
 		default:
-			return -1, "fcntl", e1
+			return -1, "fcntl", err
 		}
 	}
 	return dupCloseOnExecOld(fd)
@@ -681,7 +680,7 @@ func (fd *FD) Dup() (int, string, error) {
 
 // On Unix variants only, expose the IO event for the net code.
 
-// WaitWrite waits until data can be read from fd.
+// WaitWrite waits until data can be written to fd.
 func (fd *FD) WaitWrite() error {
 	return fd.pd.waitWrite(fd.isFile)
 }

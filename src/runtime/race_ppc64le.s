@@ -325,6 +325,52 @@ TEXT	sync∕atomic·AddUintptr(SB), NOSPLIT, $0-24
 	GO_ARGS
 	BR	sync∕atomic·AddInt64(SB)
 
+// And
+TEXT	sync∕atomic·AndInt32(SB), NOSPLIT, $0-20
+	GO_ARGS
+	MOVD	$__tsan_go_atomic32_fetch_and(SB), R8
+	BR	racecallatomic<>(SB)
+
+TEXT	sync∕atomic·AndInt64(SB), NOSPLIT, $0-24
+	GO_ARGS
+	MOVD	$__tsan_go_atomic64_fetch_and(SB), R8
+	BR	racecallatomic<>(SB)
+
+TEXT	sync∕atomic·AndUint32(SB), NOSPLIT, $0-20
+	GO_ARGS
+	BR	sync∕atomic·AndInt32(SB)
+
+TEXT	sync∕atomic·AndUint64(SB), NOSPLIT, $0-24
+	GO_ARGS
+	BR	sync∕atomic·AndInt64(SB)
+
+TEXT	sync∕atomic·AndUintptr(SB), NOSPLIT, $0-24
+	GO_ARGS
+	BR	sync∕atomic·AndInt64(SB)
+
+// Or
+TEXT	sync∕atomic·OrInt32(SB), NOSPLIT, $0-20
+	GO_ARGS
+	MOVD	$__tsan_go_atomic32_fetch_or(SB), R8
+	BR	racecallatomic<>(SB)
+
+TEXT	sync∕atomic·OrInt64(SB), NOSPLIT, $0-24
+	GO_ARGS
+	MOVD	$__tsan_go_atomic64_fetch_or(SB), R8
+	BR	racecallatomic<>(SB)
+
+TEXT	sync∕atomic·OrUint32(SB), NOSPLIT, $0-20
+	GO_ARGS
+	BR	sync∕atomic·OrInt32(SB)
+
+TEXT	sync∕atomic·OrUint64(SB), NOSPLIT, $0-24
+	GO_ARGS
+	BR	sync∕atomic·OrInt64(SB)
+
+TEXT	sync∕atomic·OrUintptr(SB), NOSPLIT, $0-24
+	GO_ARGS
+	BR	sync∕atomic·OrInt64(SB)
+
 // CompareAndSwap in tsan
 TEXT	sync∕atomic·CompareAndSwapInt32(SB), NOSPLIT, $0-17
 	GO_ARGS
@@ -363,7 +409,7 @@ TEXT	sync∕atomic·CompareAndSwapUintptr(SB), NOSPLIT, $0-25
 TEXT	racecallatomic<>(SB), NOSPLIT, $0-0
 	// Trigger SIGSEGV early if address passed to atomic function is bad.
 	MOVD	(R6), R7	// 1st arg is addr
-	MOVD	(R7), R9	// segv here if addr is bad
+	MOVB	(R7), R9	// segv here if addr is bad
 	// Check that addr is within [arenastart, arenaend) or within [racedatastart, racedataend).
 	MOVD	runtime·racearenastart(SB), R9
 	CMP	R7, R9

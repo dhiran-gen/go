@@ -54,7 +54,7 @@ type Archive struct {
 	closer io.Closer
 }
 
-// MemberHeader holds information about a big archive file header
+// ArchiveHeader holds information about a big archive file header
 type ArchiveHeader struct {
 	magic string
 }
@@ -211,7 +211,6 @@ func NewArchive(r io.ReaderAt) (*Archive, error) {
 	}
 
 	return arch, nil
-
 }
 
 // GetFile returns the XCOFF file defined by member name.
@@ -224,5 +223,4 @@ func (arch *Archive) GetFile(name string) (*File, error) {
 		}
 	}
 	return nil, fmt.Errorf("unknown member %s in archive", name)
-
 }

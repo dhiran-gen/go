@@ -5,7 +5,6 @@
 package slog
 
 import (
-	"fmt"
 	"time"
 )
 
@@ -46,30 +45,42 @@ func Bool(key string, v bool) Attr {
 	return Attr{key, BoolValue(v)}
 }
 
-// Time returns an Attr for a time.Time.
+// Time returns an Attr for a [time.Time].
 // It discards the monotonic portion.
 func Time(key string, v time.Time) Attr {
 	return Attr{key, TimeValue(v)}
 }
 
-// Duration returns an Attr for a time.Duration.
+// Duration returns an Attr for a [time.Duration].
 func Duration(key string, v time.Duration) Attr {
 	return Attr{key, DurationValue(v)}
 }
 
-// Group returns an Attr for a Group Value.
-// The caller must not subsequently mutate the
-// argument slice.
+// Group returns an Attr for a Group [Value].
+// The first argument is the key; the remaining arguments
+// are converted to Attrs as in [Logger.Log].
 //
-// Use Group to collect several Attrs under a single
+// Use Group to collect several key-value pairs under a single
 // key on a log line, or as the result of LogValue
 // in order to log a single value as multiple Attrs.
-func Group(key string, as ...Attr) Attr {
-	return Attr{key, GroupValue(as...)}
+func Group(key string, args ...any) Attr {
+	return Attr{key, GroupValue(argsToAttrSlice(args)...)}
+}
+
+func argsToAttrSlice(args []any) []Attr {
+	var (
+		attr  Attr
+		attrs []Attr
+	)
+	for len(args) > 0 {
+		attr, args = argsToAttr(args)
+		attrs = append(attrs, attr)
+	}
+	return attrs
 }
 
 // Any returns an Attr for the supplied value.
-// See [Value.AnyValue] for how values are treated.
+// See [AnyValue] for how values are treated.
 func Any(key string, value any) Attr {
 	return Attr{key, AnyValue(value)}
 }
@@ -80,7 +91,7 @@ func (a Attr) Equal(b Attr) bool {
 }
 
 func (a Attr) String() string {
-	return fmt.Sprintf("%s=%s", a.Key, a.Value)
+	return a.Key + "=" + a.Value.String()
 }
 
 // isEmpty reports whether a has an empty key and a nil value.

@@ -16,6 +16,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"internal/buildcfg"
+	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -307,7 +309,7 @@ var (
 	pe64        int
 	dr          *Dll
 
-	dexport = make([]loader.Sym, 0, 1024)
+	dexport []loader.Sym
 )
 
 // peStringTable is a COFF string table.
@@ -356,7 +358,7 @@ type peSection struct {
 // checkOffset verifies COFF section sect offset in the file.
 func (sect *peSection) checkOffset(off int64) {
 	if off != int64(sect.pointerToRawData) {
-		Errorf(nil, "%s.PointerToRawData = %#x, want %#x", sect.name, uint64(int64(sect.pointerToRawData)), uint64(off))
+		Errorf("%s.PointerToRawData = %#x, want %#x", sect.name, uint64(int64(sect.pointerToRawData)), uint64(off))
 		errorexit()
 	}
 }
@@ -365,11 +367,11 @@ func (sect *peSection) checkOffset(off int64) {
 // and file offset provided in segment seg.
 func (sect *peSection) checkSegment(seg *sym.Segment) {
 	if seg.Vaddr-uint64(PEBASE) != uint64(sect.virtualAddress) {
-		Errorf(nil, "%s.VirtualAddress = %#x, want %#x", sect.name, uint64(int64(sect.virtualAddress)), uint64(int64(seg.Vaddr-uint64(PEBASE))))
+		Errorf("%s.VirtualAddress = %#x, want %#x", sect.name, uint64(int64(sect.virtualAddress)), uint64(int64(seg.Vaddr-uint64(PEBASE))))
 		errorexit()
 	}
 	if seg.Fileoff != uint64(sect.pointerToRawData) {
-		Errorf(nil, "%s.PointerToRawData = %#x, want %#x", sect.name, uint64(int64(sect.pointerToRawData)), uint64(int64(seg.Fileoff)))
+		Errorf("%s.PointerToRawData = %#x, want %#x", sect.name, uint64(int64(sect.pointerToRawData)), uint64(int64(seg.Fileoff)))
 		errorexit()
 	}
 }
@@ -433,6 +435,8 @@ type peFile struct {
 	dataSect       *peSection
 	bssSect        *peSection
 	ctorsSect      *peSection
+	pdataSect      *peSection
+	xdataSect      *peSection
 	nextSectOffset uint32
 	nextFileOffset uint32
 	symtabOffset   int64 // offset to the start of symbol table
@@ -495,6 +499,36 @@ func (f *peFile) addDWARF() {
 		if uint64(h.pointerToRawData) != fileoff {
 			Exitf("%s.PointerToRawData = %#x, want %#x", sect.Name, h.pointerToRawData, fileoff)
 		}
+	}
+}
+
+// addSEH adds SEH information to the COFF file f.
+func (f *peFile) addSEH(ctxt *Link) {
+	// .pdata section can exist without the .xdata section.
+	// .xdata section depends on the .pdata section.
+	if Segpdata.Length == 0 {
+		return
+	}
+	d := pefile.addSection(".pdata", int(Segpdata.Length), int(Segpdata.Length))
+	d.characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ
+	if ctxt.LinkMode == LinkExternal {
+		// Some gcc versions don't honor the default alignment for the .pdata section.
+		d.characteristics |= IMAGE_SCN_ALIGN_4BYTES
+	}
+	pefile.pdataSect = d
+	d.checkSegment(&Segpdata)
+	pefile.dataDirectory[pe.IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress = d.virtualAddress
+	pefile.dataDirectory[pe.IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size = d.virtualSize
+
+	if Segxdata.Length > 0 {
+		d = pefile.addSection(".xdata", int(Segxdata.Length), int(Segxdata.Length))
+		d.characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ
+		if ctxt.LinkMode == LinkExternal {
+			// Some gcc versions don't honor the default alignment for the .xdata section.
+			d.characteristics |= IMAGE_SCN_ALIGN_4BYTES
+		}
+		pefile.xdataSect = d
+		d.checkSegment(&Segxdata)
 	}
 }
 
@@ -593,14 +627,21 @@ func (f *peFile) emitRelocations(ctxt *Link) {
 		return int(sect.Rellen / relocLen)
 	}
 
-	sects := []struct {
+	type relsect struct {
 		peSect *peSection
 		seg    *sym.Segment
 		syms   []loader.Sym
-	}{
+	}
+	sects := []relsect{
 		{f.textSect, &Segtext, ctxt.Textp},
 		{f.rdataSect, &Segrodata, ctxt.datap},
 		{f.dataSect, &Segdata, ctxt.datap},
+	}
+	if len(sehp.pdata) != 0 {
+		sects = append(sects, relsect{f.pdataSect, &Segpdata, sehp.pdata})
+	}
+	if len(sehp.xdata) != 0 {
+		sects = append(sects, relsect{f.xdataSect, &Segxdata, sehp.xdata})
 	}
 	for _, s := range sects {
 		s.peSect.emitRelocations(ctxt.Out, func() int {
@@ -628,7 +669,7 @@ dwarfLoop:
 				continue dwarfLoop
 			}
 		}
-		Errorf(nil, "emitRelocations: could not find %q section", sect.Name)
+		Errorf("emitRelocations: could not find %q section", sect.Name)
 	}
 
 	if f.ctorsSect == nil {
@@ -695,7 +736,7 @@ func (f *peFile) mapToPESection(ldr *loader.Loader, s loader.Sym, linkmode LinkM
 	if linkmode != LinkExternal {
 		return f.dataSect.index, int64(v), nil
 	}
-	if ldr.SymType(s) == sym.SDATA {
+	if ldr.SymType(s).IsDATA() {
 		return f.dataSect.index, int64(v), nil
 	}
 	// Note: although address of runtime.edata (type sym.SDATA) is at the start of .bss section
@@ -738,9 +779,9 @@ func (f *peFile) writeSymbols(ctxt *Link) {
 				// so the external linker see them as Forwarder RVA exports. See:
 				//
 				//  - https://docs.microsoft.com/en-us/windows/win32/debug/pe-format#export-address-table
-				//  - https://sourceware.org/git/?p=binutils-gdb.git;a=blob;f=ld/pe-dll.c;h=e7b82ba6ffadf74dc1b9ee71dc13d48336941e51;hb=HEAD#l972)
+				//  - https://sourceware.org/git/?p=binutils-gdb.git;a=blob;f=ld/pe-dll.c;h=e7b82ba6ffadf74dc1b9ee71dc13d48336941e51;hb=HEAD#l972
 				//
-				// CL 317917 changes "." to ":" in symbols name, so theses symbols can not be
+				// CL 317917 changes "." to ":" in symbols name, so these symbols can not be
 				// found by external linker anymore. So a hacky way is adding the
 				// underscore prefix for these 2 symbols. I don't have enough knowledge to
 				// verify whether adding the underscore for all STEXT/STYPE symbols are
@@ -752,8 +793,8 @@ func (f *peFile) writeSymbols(ctxt *Link) {
 		name = mangleABIName(ctxt, ldr, s, name)
 
 		var peSymType uint16 = IMAGE_SYM_TYPE_NULL
-		switch t {
-		case sym.STEXT, sym.SDYNIMPORT, sym.SHOSTOBJ, sym.SUNDEFEXT:
+		switch {
+		case t.IsText(), t == sym.SDYNIMPORT, t == sym.SHOSTOBJ, t == sym.SUNDEFEXT:
 			// Microsoft's PE documentation is contradictory. It says that the symbol's complex type
 			// is stored in the pesym.Type most significant byte, but MSVC, LLVM, and mingw store it
 			// in the 4 high bits of the less significant byte. Also, the PE documentation says that
@@ -787,11 +828,11 @@ func (f *peFile) writeSymbols(ctxt *Link) {
 
 	// Add special runtime.text and runtime.etext symbols.
 	s := ldr.Lookup("runtime.text", 0)
-	if ldr.SymType(s) == sym.STEXT {
+	if ldr.SymType(s).IsText() {
 		addsym(s)
 	}
 	s = ldr.Lookup("runtime.etext", 0)
-	if ldr.SymType(s) == sym.STEXT {
+	if ldr.SymType(s).IsText() {
 		addsym(s)
 	}
 
@@ -1110,11 +1151,11 @@ func Peinit(ctxt *Link) {
 	}
 
 	HEADR = PEFILEHEADR
-	if *FlagTextAddr == -1 {
-		*FlagTextAddr = PEBASE + int64(PESECTHEADR)
-	}
 	if *FlagRound == -1 {
-		*FlagRound = int(PESECTALIGN)
+		*FlagRound = PESECTALIGN
+	}
+	if *FlagTextAddr == -1 {
+		*FlagTextAddr = Rnd(PEBASE, *FlagRound) + int64(PESECTHEADR)
 	}
 }
 
@@ -1351,7 +1392,7 @@ func initdynexport(ctxt *Link) {
 		if !ldr.AttrReachable(s) || !ldr.AttrCgoExportDynamic(s) {
 			continue
 		}
-		if len(dexport)+1 > cap(dexport) {
+		if len(dexport) >= math.MaxUint16 {
 			ctxt.Errorf(s, "pe dynexport table is full")
 			errorexit()
 		}
@@ -1450,10 +1491,6 @@ type peBaseRelocBlock struct {
 // it can be sorted.
 type pePages []uint32
 
-func (p pePages) Len() int           { return len(p) }
-func (p pePages) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
-func (p pePages) Less(i, j int) bool { return p[i] < p[j] }
-
 // A PE base relocation table is a list of blocks, where each block
 // contains relocation information for a single page. The blocks
 // must be emitted in order of page virtual address.
@@ -1507,10 +1544,23 @@ func (rt *peBaseRelocTable) write(ctxt *Link) {
 	out := ctxt.Out
 
 	// sort the pages array
-	sort.Sort(rt.pages)
+	slices.Sort(rt.pages)
+
+	// .reloc section must be 32-bit aligned
+	if out.Offset()&3 != 0 {
+		Errorf("internal error, start of .reloc not 32-bit aligned")
+	}
 
 	for _, p := range rt.pages {
 		b := rt.blocks[p]
+
+		// Add a dummy entry at the end of the list if we have an
+		// odd number of entries, so as to ensure that the next
+		// block starts on a 32-bit boundary (see issue 68260).
+		if len(b.entries)&1 != 0 {
+			b.entries = append(b.entries, peBaseRelocEntry{})
+		}
+
 		const sizeOfPEbaseRelocBlock = 8 // 2 * sizeof(uint32)
 		blockSize := uint32(sizeOfPEbaseRelocBlock + len(b.entries)*2)
 		out.Write32(p)
@@ -1595,11 +1645,12 @@ func addPEBaseReloc(ctxt *Link) {
 func (ctxt *Link) dope() {
 	initdynimport(ctxt)
 	initdynexport(ctxt)
+	writeSEH(ctxt)
 }
 
 func setpersrc(ctxt *Link, syms []loader.Sym) {
 	if len(rsrcsyms) != 0 {
-		Errorf(nil, "too many .rsrc sections")
+		Errorf("too many .rsrc sections")
 	}
 	rsrcsyms = syms
 }
@@ -1689,6 +1740,7 @@ func asmbPe(ctxt *Link) {
 		pefile.bssSect = b
 	}
 
+	pefile.addSEH(ctxt)
 	pefile.addDWARF()
 
 	if ctxt.LinkMode == LinkExternal {

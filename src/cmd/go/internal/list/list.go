@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -244,6 +245,8 @@ applied to a Go struct, but now a Module struct:
         Retracted  []string      // retraction information, if any (with -retracted or -u)
         Deprecated string        // deprecation message, if any (with -u)
         Error      *ModuleError  // error loading module
+        Sum        string        // checksum for path, version (as in go.sum)
+        GoModSum   string        // checksum for go.mod (as in go.sum)
         Origin     any           // provenance of module
         Reuse      bool          // reuse of old module info is safe
     }
@@ -342,10 +345,9 @@ For more about modules, see https://golang.org/ref/mod.
 
 func init() {
 	CmdList.Run = runList // break init cycle
-	work.AddBuildFlags(CmdList, work.DefaultBuildFlags)
-	if cfg.Experiment != nil && cfg.Experiment.CoverageRedesign {
-		work.AddCoverFlags(CmdList, nil)
-	}
+	// Omit build -json because list has its own -json
+	work.AddBuildFlags(CmdList, work.OmitJSONFlag)
+	work.AddCoverFlags(CmdList, nil)
 	CmdList.Flag.Var(&listJsonFields, "json", "")
 }
 
@@ -386,7 +388,7 @@ func (v *jsonFlag) Set(s string) error {
 }
 
 func (v *jsonFlag) String() string {
-	var fields []string
+	fields := make([]string, 0, len(*v))
 	for f := range *v {
 		fields = append(fields, f)
 	}
@@ -448,13 +450,15 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 	if listJson {
 		do = func(x any) {
 			if !listJsonFields.needAll() {
-				v := reflect.ValueOf(x).Elem() // do is always called with a non-nil pointer.
-				// Clear all non-requested fields.
+				//  Set x to a copy of itself with all non-requested fields cleared.
+				v := reflect.New(reflect.TypeOf(x).Elem()).Elem() // do is always called with a non-nil pointer.
+				v.Set(reflect.ValueOf(x).Elem())
 				for i := 0; i < v.NumField(); i++ {
 					if !listJsonFields.needAny(v.Type().Field(i).Name) {
 						v.Field(i).SetZero()
 					}
 				}
+				x = v.Interface()
 			}
 			b, err := json.MarshalIndent(x, "", "\t")
 			if err != nil {
@@ -569,11 +573,11 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 		if !*listE {
 			for _, m := range mods {
 				if m.Error != nil {
-					base.Errorf("go: %v", m.Error.Err)
+					base.Error(errors.New(m.Error.Err))
 				}
 			}
 			if err != nil {
-				base.Errorf("go: %v", err)
+				base.Error(err)
 			}
 			base.ExitIfErrors()
 		}
@@ -624,20 +628,6 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 		base.ExitIfErrors()
 	}
 
-	if cache.Default() == nil {
-		// These flags return file names pointing into the build cache,
-		// so the build cache must exist.
-		if *listCompiled {
-			base.Fatalf("go list -compiled requires build cache")
-		}
-		if *listExport {
-			base.Fatalf("go list -export requires build cache")
-		}
-		if *listTest {
-			base.Fatalf("go list -test requires build cache")
-		}
-	}
-
 	if *listTest {
 		c := cache.Default()
 		// Add test binaries to packages to be listed.
@@ -651,7 +641,6 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 		for _, p := range pkgs {
 			if len(p.TestGoFiles)+len(p.XTestGoFiles) > 0 {
 				var pmain, ptest, pxtest *load.Package
-				var err error
 				if *listE {
 					sema.Acquire(ctx, 1)
 					wg.Add(1)
@@ -661,9 +650,10 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 					}
 					pmain, ptest, pxtest = load.TestPackagesAndErrors(ctx, done, pkgOpts, p, nil)
 				} else {
-					pmain, ptest, pxtest, err = load.TestPackagesFor(ctx, pkgOpts, p, nil)
-					if err != nil {
-						base.Fatalf("can't load test package: %s", err)
+					var perr *load.Package
+					pmain, ptest, pxtest, perr = load.TestPackagesFor(ctx, pkgOpts, p, nil)
+					if perr != nil {
+						base.Fatalf("go: can't load test package: %s", perr.Error)
 					}
 				}
 				testPackages = append(testPackages, testPackageSet{p, pmain, ptest, pxtest})
@@ -729,13 +719,16 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 		}
 		defer func() {
 			if err := b.Close(); err != nil {
-				base.Fatalf("go: %v", err)
+				base.Fatal(err)
 			}
 		}()
 
 		b.IsCmdList = true
 		b.NeedExport = *listExport
 		b.NeedCompiledGoFiles = *listCompiled
+		if cfg.BuildCover {
+			load.PrepareForCoverageBuild(pkgs)
+		}
 		a := &work.Action{}
 		// TODO: Use pkgsFilter?
 		for _, p := range pkgs {
@@ -790,9 +783,7 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 					p.Imports[i] = new
 				}
 			}
-			for old := range m {
-				delete(m, old)
-			}
+			clear(m)
 		}
 	}
 
@@ -861,7 +852,7 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 			}
 			rmods, err := modload.ListModules(ctx, args, mode, *listReuse)
 			if err != nil && !*listE {
-				base.Errorf("go: %v", err)
+				base.Error(err)
 			}
 			for i, arg := range args {
 				rmod := rmods[i]
@@ -962,8 +953,20 @@ func collectDepsErrors(p *load.Package) {
 	// one error set on it.
 	sort.Slice(p.DepsErrors, func(i, j int) bool {
 		stki, stkj := p.DepsErrors[i].ImportStack, p.DepsErrors[j].ImportStack
+		// Some packages are missing import stacks. To ensure deterministic
+		// sort order compare two errors that are missing import stacks by
+		// their errors' error texts.
+		if len(stki) == 0 {
+			if len(stkj) != 0 {
+				return true
+			}
+
+			return p.DepsErrors[i].Err.Error() < p.DepsErrors[j].Err.Error()
+		} else if len(stkj) == 0 {
+			return false
+		}
 		pathi, pathj := stki[len(stki)-1], stkj[len(stkj)-1]
-		return pathi < pathj
+		return pathi.Pkg < pathj.Pkg
 	})
 }
 

@@ -65,10 +65,6 @@ func TestCgoCallbackGC(t *testing.T) {
 			t.Skip("too slow for mips64x builders")
 		}
 	}
-	if testenv.Builder() == "darwin-amd64-10_14" {
-		// TODO(#23011): When the 10.14 builders are gone, remove this skip.
-		t.Skip("skipping due to platform bug on macOS 10.14; see https://golang.org/issue/43926")
-	}
 	got := runTestProg(t, "testprogcgo", "CgoCallbackGC")
 	want := "OK\n"
 	if got != want {
@@ -112,6 +108,9 @@ func TestCgoExternalThreadSignal(t *testing.T) {
 
 	got := runTestProg(t, "testprogcgo", "CgoExternalThreadSignal")
 	if want := "OK\n"; got != want {
+		if runtime.GOOS == "ios" && strings.Contains(got, "C signal did not crash as expected") {
+			testenv.SkipFlaky(t, 59913)
+		}
 		t.Fatalf("expected %q, but got:\n%s", want, got)
 	}
 }
@@ -371,6 +370,10 @@ func TestRaceProf(t *testing.T) {
 	if !platform.RaceDetectorSupported(runtime.GOOS, runtime.GOARCH) {
 		t.Skipf("skipping on %s/%s because race detector not supported", runtime.GOOS, runtime.GOARCH)
 	}
+	if runtime.GOOS == "windows" {
+		t.Skipf("skipping: test requires pthread support")
+		// TODO: Can this test be rewritten to use the C11 thread API instead?
+	}
 
 	testenv.MustHaveGoRun(t)
 
@@ -399,6 +402,13 @@ func TestRaceSignal(t *testing.T) {
 	if !platform.RaceDetectorSupported(runtime.GOOS, runtime.GOARCH) {
 		t.Skipf("skipping on %s/%s because race detector not supported", runtime.GOOS, runtime.GOARCH)
 	}
+	if runtime.GOOS == "windows" {
+		t.Skipf("skipping: test requires pthread support")
+		// TODO: Can this test be rewritten to use the C11 thread API instead?
+	}
+	if runtime.GOOS == "darwin" || runtime.GOOS == "ios" {
+		testenv.SkipFlaky(t, 60316)
+	}
 
 	t.Parallel()
 
@@ -415,7 +425,7 @@ func TestRaceSignal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := testenv.CleanCmdEnv(exec.Command(exe, "CgoRaceSignal")).CombinedOutput()
+	got, err := testenv.CleanCmdEnv(testenv.Command(t, exe, "CgoRaceSignal")).CombinedOutput()
 	if err != nil {
 		t.Logf("%s\n", got)
 		t.Fatal(err)
@@ -516,6 +526,9 @@ func TestCgoTracebackSigpanic(t *testing.T) {
 		// the Windows exception handler unwind it, rather
 		// than injecting a sigpanic.
 		t.Skip("no sigpanic in C on windows")
+	}
+	if runtime.GOOS == "ios" {
+		testenv.SkipFlaky(t, 59912)
 	}
 	t.Parallel()
 	got := runTestProg(t, "testprogcgo", "TracebackSigpanic")
@@ -626,8 +639,16 @@ func TestSegv(t *testing.T) {
 		}
 
 		t.Run(test, func(t *testing.T) {
+			if test == "SegvInCgo" && runtime.GOOS == "ios" {
+				testenv.SkipFlaky(t, 59947) // Don't even try, in case it times out.
+			}
+
 			t.Parallel()
-			got := runTestProg(t, "testprogcgo", test)
+			prog := "testprog"
+			if strings.HasSuffix(test, "InCgo") {
+				prog = "testprogcgo"
+			}
+			got := runTestProg(t, prog, test)
 			t.Log(got)
 			want := "SIGSEGV"
 			if !strings.Contains(got, want) {
@@ -639,7 +660,7 @@ func TestSegv(t *testing.T) {
 
 			// No runtime errors like "runtime: unknown pc".
 			switch runtime.GOOS {
-			case "darwin", "illumos", "solaris":
+			case "darwin", "ios", "illumos", "solaris":
 				// Runtime sometimes throws when generating the traceback.
 				testenv.SkipFlaky(t, 49182)
 			case "linux":
@@ -728,43 +749,36 @@ func TestNeedmDeadlock(t *testing.T) {
 	}
 }
 
+func TestCgoNoCallback(t *testing.T) {
+	got := runTestProg(t, "testprogcgo", "CgoNoCallback")
+	want := "function marked with #cgo nocallback called back into Go"
+	if !strings.Contains(got, want) {
+		t.Fatalf("did not see %q in output:\n%s", want, got)
+	}
+}
+
+func TestCgoNoEscape(t *testing.T) {
+	got := runTestProg(t, "testprogcgo", "CgoNoEscape")
+	want := "OK\n"
+	if got != want {
+		t.Fatalf("want %s, got %s\n", want, got)
+	}
+}
+
+// Issue #63739.
+func TestCgoEscapeWithMultiplePointers(t *testing.T) {
+	got := runTestProg(t, "testprogcgo", "CgoEscapeWithMultiplePointers")
+	want := "OK\n"
+	if got != want {
+		t.Fatalf("output is %s; want %s", got, want)
+	}
+}
+
 func TestCgoTracebackGoroutineProfile(t *testing.T) {
 	output := runTestProg(t, "testprogcgo", "GoroutineProfile")
 	want := "OK\n"
 	if output != want {
 		t.Fatalf("want %s, got %s\n", want, output)
-	}
-}
-
-func TestCgoTraceParser(t *testing.T) {
-	// Test issue 29707.
-	switch runtime.GOOS {
-	case "plan9", "windows":
-		t.Skipf("no pthreads on %s", runtime.GOOS)
-	}
-	output := runTestProg(t, "testprogcgo", "CgoTraceParser")
-	want := "OK\n"
-	ErrTimeOrder := "ErrTimeOrder\n"
-	if output == ErrTimeOrder {
-		t.Skipf("skipping due to golang.org/issue/16755: %v", output)
-	} else if output != want {
-		t.Fatalf("want %s, got %s\n", want, output)
-	}
-}
-
-func TestCgoTraceParserWithOneProc(t *testing.T) {
-	// Test issue 29707.
-	switch runtime.GOOS {
-	case "plan9", "windows":
-		t.Skipf("no pthreads on %s", runtime.GOOS)
-	}
-	output := runTestProg(t, "testprogcgo", "CgoTraceParser", "GOMAXPROCS=1")
-	want := "OK\n"
-	ErrTimeOrder := "ErrTimeOrder\n"
-	if output == ErrTimeOrder {
-		t.Skipf("skipping due to golang.org/issue/16755: %v", output)
-	} else if output != want {
-		t.Fatalf("GOMAXPROCS=1, want %s, got %s\n", want, output)
 	}
 }
 
@@ -813,5 +827,45 @@ func TestDestructorCallbackRace(t *testing.T) {
 
 	if want := "OK\n"; string(got) != want {
 		t.Errorf("expected %q, but got:\n%s", want, got)
+	}
+}
+
+func TestEnsureBindM(t *testing.T) {
+	t.Parallel()
+	switch runtime.GOOS {
+	case "windows", "plan9":
+		t.Skipf("skipping bindm test on %s", runtime.GOOS)
+	}
+	got := runTestProg(t, "testprogcgo", "EnsureBindM")
+	want := "OK\n"
+	if got != want {
+		t.Errorf("expected %q, got %v", want, got)
+	}
+}
+
+func TestStackSwitchCallback(t *testing.T) {
+	t.Parallel()
+	switch runtime.GOOS {
+	case "windows", "plan9", "android", "ios", "openbsd": // no getcontext
+		t.Skipf("skipping test on %s", runtime.GOOS)
+	}
+	got := runTestProg(t, "testprogcgo", "StackSwitchCallback")
+	skip := "SKIP\n"
+	if got == skip {
+		t.Skip("skipping on musl/bionic libc")
+	}
+	want := "OK\n"
+	if got != want {
+		t.Errorf("expected %q, got %v", want, got)
+	}
+}
+
+func TestCgoToGoCallGoexit(t *testing.T) {
+	if runtime.GOOS == "plan9" || runtime.GOOS == "windows" {
+		t.Skipf("no pthreads on %s", runtime.GOOS)
+	}
+	output := runTestProg(t, "testprogcgo", "CgoToGoCallGoexit")
+	if !strings.Contains(output, "runtime.Goexit called in a thread that was not created by the Go runtime") {
+		t.Fatalf("output should contain %s, got %s", "runtime.Goexit called in a thread that was not created by the Go runtime", output)
 	}
 }

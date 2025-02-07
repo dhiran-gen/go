@@ -9,23 +9,34 @@ package types2
 import (
 	"cmd/compile/internal/syntax"
 	"fmt"
-	. "internal/types/errors"
+	"slices"
 	"strings"
 )
+
+// If enableReverseTypeInference is set, uninstantiated and
+// partially instantiated generic functions may be assigned
+// (incl. returned) to variables of function type and type
+// inference will attempt to infer the missing type arguments.
+// Available with go1.21.
+const enableReverseTypeInference = true // disable for debugging
 
 // infer attempts to infer the complete set of type arguments for generic function instantiation/call
 // based on the given type parameters tparams, type arguments targs, function parameters params, and
 // function arguments args, if any. There must be at least one type parameter, no more type arguments
 // than type parameters, and params and args must match in number (incl. zero).
+// If reverse is set, an error message's contents are reversed for a better error message for some
+// errors related to reverse type inference (where the function call is synthetic).
 // If successful, infer returns the complete list of given and inferred type arguments, one for each
-// type parameter. Otherwise the result is nil and appropriate errors will be reported.
-func (check *Checker) infer(pos syntax.Pos, tparams []*TypeParam, targs []Type, params *Tuple, args []*operand) (inferred []Type) {
-	if debug {
+// type parameter. Otherwise the result is nil. Errors are reported through the err parameter.
+// Note: infer may fail (return nil) due to invalid args operands without reporting additional errors.
+func (check *Checker) infer(pos syntax.Pos, tparams []*TypeParam, targs []Type, params *Tuple, args []*operand, reverse bool, err *error_) (inferred []Type) {
+	// Don't verify result conditions if there's no error handler installed:
+	// in that case, an error leads to an exit panic and the result value may
+	// be incorrect. But in that case it doesn't matter because callers won't
+	// be able to use it either.
+	if check.conf.Error != nil {
 		defer func() {
-			assert(inferred == nil || len(inferred) == len(tparams))
-			for _, targ := range inferred {
-				assert(targ != nil)
-			}
+			assert(inferred == nil || len(inferred) == len(tparams) && !slices.Contains(inferred, nil))
 		}()
 	}
 
@@ -40,14 +51,21 @@ func (check *Checker) infer(pos syntax.Pos, tparams []*TypeParam, targs []Type, 
 	n := len(tparams)
 	assert(n > 0 && len(targs) <= n)
 
-	// Function parameters and arguments must match in number.
+	// Parameters and arguments must match in number.
 	assert(params.Len() == len(args))
 
 	// If we already have all type arguments, we're done.
-	if len(targs) == n {
+	if len(targs) == n && !slices.Contains(targs, nil) {
 		return targs
 	}
-	// len(targs) < n
+
+	// If we have invalid (ordinary) arguments, an error was reported before.
+	// Avoid additional inference errors and exit early (go.dev/issue/60434).
+	for _, arg := range args {
+		if arg.mode == invalid {
+			return nil
+		}
+	}
 
 	// Make sure we have a "full" list of type arguments, some of which may
 	// be nil (unknown). Make a copy so as to not clobber the incoming slice.
@@ -93,9 +111,9 @@ func (check *Checker) infer(pos syntax.Pos, tparams []*TypeParam, targs []Type, 
 	// Unify parameter and argument types for generic parameters with typed arguments
 	// and collect the indices of generic parameters with untyped arguments.
 	// Terminology: generic parameter = function parameter with a type-parameterized type
-	u := newUnifier(tparams, targs)
+	u := newUnifier(tparams, targs, check.allowVersion(go1_21))
 
-	errorf := func(kind string, tpar, targ Type, arg *operand) {
+	errorf := func(tpar, targ Type, arg *operand) {
 		// provide a better error message if we can
 		targs := u.inferred(tparams)
 		if targs[0] == nil {
@@ -110,7 +128,7 @@ func (check *Checker) infer(pos syntax.Pos, tparams []*TypeParam, targs []Type, 
 				}
 			}
 			if allFailed {
-				check.errorf(arg, CannotInferTypeArgs, "%s %s of %s does not match %s (cannot infer %s)", kind, targ, arg.expr, tpar, typeParamsString(tparams))
+				err.addf(arg, "type %s of %s does not match %s (cannot infer %s)", targ, arg.expr, tpar, typeParamsString(tparams))
 				return
 			}
 		}
@@ -122,9 +140,13 @@ func (check *Checker) infer(pos syntax.Pos, tparams []*TypeParam, targs []Type, 
 		// InvalidTypeArg). We can't differentiate these cases, so fall back on
 		// the more general CannotInferTypeArgs.
 		if inferred != tpar {
-			check.errorf(arg, CannotInferTypeArgs, "%s %s of %s does not match inferred type %s for %s", kind, targ, arg.expr, inferred, tpar)
+			if reverse {
+				err.addf(arg, "inferred type %s for %s does not match type %s of %s", inferred, tpar, targ, arg.expr)
+			} else {
+				err.addf(arg, "type %s of %s does not match inferred type %s for %s", targ, arg.expr, inferred, tpar)
+			}
 		} else {
-			check.errorf(arg, CannotInferTypeArgs, "%s %s of %s does not match %s", kind, targ, arg.expr, tpar)
+			err.addf(arg, "type %s of %s does not match %s", targ, arg.expr, tpar)
 		}
 	}
 
@@ -140,28 +162,33 @@ func (check *Checker) infer(pos syntax.Pos, tparams []*TypeParam, targs []Type, 
 	}
 
 	for i, arg := range args {
+		if arg.mode == invalid {
+			// An error was reported earlier. Ignore this arg
+			// and continue, we may still be able to infer all
+			// targs resulting in fewer follow-on errors.
+			// TODO(gri) determine if we still need this check
+			continue
+		}
 		par := params.At(i)
-		// If we permit bidirectional unification, this conditional code needs to be
-		// executed even if par.typ is not parameterized since the argument may be a
-		// generic function (for which we want to infer its type arguments).
-		if isParameterized(tparams, par.typ) {
-			if arg.mode == invalid {
-				// An error was reported earlier. Ignore this targ
-				// and continue, we may still be able to infer all
-				// targs resulting in fewer follow-on errors.
-				continue
-			}
+		if isParameterized(tparams, par.typ) || isParameterized(tparams, arg.typ) {
+			// Function parameters are always typed. Arguments may be untyped.
+			// Collect the indices of untyped arguments and handle them later.
 			if isTyped(arg.typ) {
-				if !u.unify(par.typ, arg.typ) {
-					errorf("type", par.typ, arg.typ, arg)
+				if !u.unify(par.typ, arg.typ, assign) {
+					errorf(par.typ, arg.typ, arg)
 					return nil
 				}
-			} else if _, ok := par.typ.(*TypeParam); ok {
+			} else if _, ok := par.typ.(*TypeParam); ok && !arg.isNil() {
 				// Since default types are all basic (i.e., non-composite) types, an
 				// untyped argument will never match a composite parameter type; the
 				// only parameter type it can possibly match against is a *TypeParam.
 				// Thus, for untyped arguments we only need to look at parameter types
 				// that are single type parameters.
+				// Also, untyped nils don't have a default type and can be ignored.
+				// Finally, it's not possible to have an alias type denoting a type
+				// parameter declared by the current function and use it in the same
+				// function signature; hence we don't need to Unalias before the
+				// .(*TypeParam) type assertion above.
 				untyped = append(untyped, i)
 			}
 		}
@@ -210,12 +237,15 @@ func (check *Checker) infer(pos syntax.Pos, tparams []*TypeParam, targs []Type, 
 				u.tracef("-- type parameter %s = %s: core(%s) = %s, single = %v", tpar, tx, tpar, core, single)
 			}
 
-			// If there is a core term (i.e., a core type with tilde information)
-			// unify the type parameter with the core type.
+			// If the type parameter's constraint has a core term (i.e., a core type with tilde information)
+			// try to unify the type parameter with that core type.
 			if core != nil {
-				// A type parameter can be unified with its core type in two cases.
+				// A type parameter can be unified with its constraint's core type in two cases.
 				switch {
 				case tx != nil:
+					if traceInference {
+						u.tracef("-> unify type parameter %s (type %s) with constraint core type %s", tpar, tx, core.typ)
+					}
 					// The corresponding type argument tx is known. There are 2 cases:
 					// 1) If the core type has a tilde, per spec requirement for tilde
 					//    elements, the core type is an underlying (literal) type.
@@ -226,28 +256,53 @@ func (check *Checker) infer(pos syntax.Pos, tparams []*TypeParam, targs []Type, 
 					//    core type.
 					// 2) If the core type doesn't have a tilde, we also must unify tx
 					//    with the core type.
-					if !u.unify(tx, core.typ) {
-						check.errorf(pos, CannotInferTypeArgs, "%s does not match %s", tpar, core.typ)
+					if !u.unify(tx, core.typ, 0) {
+						// TODO(gri) Type parameters that appear in the constraint and
+						//           for which we have type arguments inferred should
+						//           use those type arguments for a better error message.
+						err.addf(pos, "%s (type %s) does not satisfy %s", tpar, tx, tpar.Constraint())
 						return nil
 					}
 				case single && !core.tilde:
-					// The corresponding type argument tx is unknown and there's a single
-					// specific type and no tilde.
+					if traceInference {
+						u.tracef("-> set type parameter %s to constraint core type %s", tpar, core.typ)
+					}
+					// The corresponding type argument tx is unknown and the core term
+					// describes a single specific type and no tilde.
 					// In this case the type argument must be that single type; set it.
 					u.set(tpar, core.typ)
 				}
-			} else {
-				if tx != nil {
-					// We don't have a core type, but the type argument tx is known.
-					// It must have (at least) all the methods of the type constraint,
-					// and the method signatures must unify; otherwise tx cannot satisfy
-					// the constraint.
-					var cause string
-					constraint := tpar.iface()
-					if m, _ := check.missingMethod(tx, constraint, true, u.unify, &cause); m != nil {
-						check.errorf(pos, CannotInferTypeArgs, "%s does not satisfy %s %s", tx, constraint, cause)
-						return nil
-					}
+			}
+
+			// Independent of whether there is a core term, if the type argument tx is known
+			// it must implement the methods of the type constraint, possibly after unification
+			// of the relevant method signatures, otherwise tx cannot satisfy the constraint.
+			// This unification step may provide additional type arguments.
+			//
+			// Note: The type argument tx may be known but contain references to other type
+			// parameters (i.e., tx may still be parameterized).
+			// In this case the methods of tx don't correctly reflect the final method set
+			// and we may get a missing method error below. Skip this step in this case.
+			//
+			// TODO(gri) We should be able continue even with a parameterized tx if we add
+			// a simplify step beforehand (see below). This will require factoring out the
+			// simplify phase so we can call it from here.
+			if tx != nil && !isParameterized(tparams, tx) {
+				if traceInference {
+					u.tracef("-> unify type parameter %s (type %s) methods with constraint methods", tpar, tx)
+				}
+				// TODO(gri) Now that unification handles interfaces, this code can
+				//           be reduced to calling u.unify(tx, tpar.iface(), assign)
+				//           (which will compare signatures exactly as we do below).
+				//           We leave it as is for now because missingMethod provides
+				//           a failure cause which allows for a better error message.
+				//           Eventually, unify should return an error with cause.
+				var cause string
+				constraint := tpar.iface()
+				if !check.hasAllMethods(tx, constraint, true, func(x, y Type) bool { return u.unify(x, y, exact) }, &cause) {
+					// TODO(gri) better error message (see TODO above)
+					err.addf(pos, "%s (type %s) does not satisfy %s %s", tpar, tx, tpar.Constraint(), cause)
+					return nil
 				}
 			}
 		}
@@ -263,38 +318,43 @@ func (check *Checker) infer(pos syntax.Pos, tparams []*TypeParam, targs []Type, 
 	}
 
 	// --- 3 ---
-	// use information from untyped contants
+	// use information from untyped constants
 
 	if traceInference {
 		u.tracef("== untyped arguments: %v", untyped)
 	}
 
 	// Some generic parameters with untyped arguments may have been given a type by now.
-	// Collect all remaining parameters that don't have a type yet and unify them with
-	// the default types of the untyped arguments.
-	// We need to collect them all before unifying them with their untyped arguments;
-	// otherwise a parameter type that appears multiple times will have a type after
-	// the first unification and will be skipped later on, leading to incorrect results.
-	j := 0
-	for _, i := range untyped {
-		tpar := params.At(i).typ.(*TypeParam) // is type parameter by construction of untyped
+	// Collect all remaining parameters that don't have a type yet and determine the
+	// maximum untyped type for each of those parameters, if possible.
+	var maxUntyped map[*TypeParam]Type // lazily allocated (we may not need it)
+	for _, index := range untyped {
+		tpar := params.At(index).typ.(*TypeParam) // is type parameter (no alias) by construction of untyped
 		if u.at(tpar) == nil {
-			untyped[j] = i
-			j++
+			arg := args[index] // arg corresponding to tpar
+			if maxUntyped == nil {
+				maxUntyped = make(map[*TypeParam]Type)
+			}
+			max := maxUntyped[tpar]
+			if max == nil {
+				max = arg.typ
+			} else {
+				m := maxType(max, arg.typ)
+				if m == nil {
+					err.addf(arg, "mismatched types %s and %s (cannot infer %s)", max, arg.typ, tpar)
+					return nil
+				}
+				max = m
+			}
+			maxUntyped[tpar] = max
 		}
 	}
-	// untyped[:j] are the indices of parameters without a type yet
-	for _, i := range untyped[:j] {
-		tpar := params.At(i).typ.(*TypeParam)
-		arg := args[i]
-		typ := Default(arg.typ)
-		// The default type for an untyped nil is untyped nil which must
-		// not be inferred as type parameter type. Ignore them by making
-		// sure all default types are typed.
-		if isTyped(typ) && !u.unify(tpar, typ) {
-			errorf("default type", tpar, typ, arg)
-			return nil
-		}
+	// maxUntyped contains the maximum untyped type for each type parameter
+	// which doesn't have a type yet. Set the respective default types.
+	for tpar, typ := range maxUntyped {
+		d := Default(typ)
+		assert(isTyped(d))
+		u.set(tpar, d)
 	}
 
 	// --- simplify ---
@@ -349,6 +409,9 @@ func (check *Checker) infer(pos syntax.Pos, tparams []*TypeParam, targs []Type, 
 	}
 
 	for len(dirty) > 0 {
+		if traceInference {
+			u.tracef("-- simplify %s ➞ %s", tparams, inferred)
+		}
 		// TODO(gri) Instead of creating a new substMap for each iteration,
 		// provide an update operation for substMaps and only change when
 		// needed. Optimization.
@@ -357,6 +420,21 @@ func (check *Checker) infer(pos syntax.Pos, tparams []*TypeParam, targs []Type, 
 		for _, index := range dirty {
 			t0 := inferred[index]
 			if t1 := check.subst(nopos, t0, smap, nil, check.context()); t1 != t0 {
+				// t0 was simplified to t1.
+				// If t0 was a generic function, but the simplified signature t1 does
+				// not contain any type parameters anymore, the function is not generic
+				// anymore. Remove its type parameters. (go.dev/issue/59953)
+				// Note that if t0 was a signature, t1 must be a signature, and t1
+				// can only be a generic signature if it originated from a generic
+				// function argument. Those signatures are never defined types and
+				// thus there is no need to call under below.
+				// TODO(gri) Consider doing this in Checker.subst.
+				//           Then this would fall out automatically here and also
+				//           in instantiation (where we also explicitly nil out
+				//           type parameters). See the *Signature TODO in subst.
+				if sig, _ := t1.(*Signature); sig != nil && sig.TypeParams().Len() > 0 && !isParameterized(tparams, sig) {
+					sig.tparams = nil
+				}
 				inferred[index] = t1
 				dirty[n] = index
 				n++
@@ -372,7 +450,7 @@ func (check *Checker) infer(pos syntax.Pos, tparams []*TypeParam, targs []Type, 
 	for i, typ := range inferred {
 		if typ == nil || isParameterized(tparams, typ) {
 			obj := tparams[i].obj
-			check.errorf(pos, CannotInferTypeArgs, "cannot infer %s (%s)", obj.name, obj.pos)
+			err.addf(pos, "cannot infer %s (declared at %v)", obj.name, obj.pos)
 			return nil
 		}
 	}
@@ -380,11 +458,14 @@ func (check *Checker) infer(pos syntax.Pos, tparams []*TypeParam, targs []Type, 
 	return
 }
 
-// renameTParams renames the type parameters in a function signature described by its
-// type and ordinary parameters (tparams and params) such that each type parameter is
-// given a new identity. renameTParams returns the new type and ordinary parameters.
+// renameTParams renames the type parameters in the given type such that each type
+// parameter is given a new identity. renameTParams returns the new type parameters
+// and updated type. If the result type is unchanged from the argument type, none
+// of the type parameters in tparams occurred in the type.
+// If typ is a generic function, type parameters held with typ are not changed and
+// must be updated separately if desired.
 // The positions is only used for debug traces.
-func (check *Checker) renameTParams(pos syntax.Pos, tparams []*TypeParam, params *Tuple) ([]*TypeParam, *Tuple) {
+func (check *Checker) renameTParams(pos syntax.Pos, tparams []*TypeParam, typ Type) ([]*TypeParam, Type) {
 	// For the purpose of type inference we must differentiate type parameters
 	// occurring in explicit type or value function arguments from the type
 	// parameters we are solving for via unification because they may be the
@@ -413,7 +494,7 @@ func (check *Checker) renameTParams(pos syntax.Pos, tparams []*TypeParam, params
 	// Type parameter renaming turns the first example into the second
 	// example by renaming the type parameter P into P2.
 	if len(tparams) == 0 {
-		return nil, params // nothing to do
+		return nil, typ // nothing to do
 	}
 
 	tparams2 := make([]*TypeParam, len(tparams))
@@ -428,7 +509,7 @@ func (check *Checker) renameTParams(pos syntax.Pos, tparams []*TypeParam, params
 		tparams2[i].bound = check.subst(pos, tparam.bound, renameMap, nil, check.context())
 	}
 
-	return tparams2, check.subst(pos, params, renameMap, nil, check.context()).(*Tuple)
+	return tparams2, check.subst(pos, typ, renameMap, nil, check.context())
 }
 
 // typeParamsString produces a string containing all the type parameter names
@@ -459,6 +540,8 @@ func typeParamsString(list []*TypeParam) string {
 }
 
 // isParameterized reports whether typ contains any of the type parameters of tparams.
+// If typ is a generic function, isParameterized ignores the type parameter declarations;
+// it only considers the signature proper (incoming and result parameters).
 func isParameterized(tparams []*TypeParam, typ Type) bool {
 	w := tpWalker{
 		tparams: tparams,
@@ -486,6 +569,9 @@ func (w *tpWalker) isParameterized(typ Type) (res bool) {
 	case *Basic:
 		// nothing to do
 
+	case *Alias:
+		return w.isParameterized(Unalias(t))
+
 	case *Array:
 		return w.isParameterized(t.elem)
 
@@ -498,16 +584,20 @@ func (w *tpWalker) isParameterized(typ Type) (res bool) {
 	case *Pointer:
 		return w.isParameterized(t.base)
 
-	// case *Tuple:
-	//      This case should not occur because tuples only appear
-	//      in signatures where they are handled explicitly.
+	case *Tuple:
+		// This case does not occur from within isParameterized
+		// because tuples only appear in signatures where they
+		// are handled explicitly. But isParameterized is also
+		// called by Checker.callExpr with a function result tuple
+		// if instantiation failed (go.dev/issue/59890).
+		return t != nil && w.varList(t.vars)
 
 	case *Signature:
 		// t.tparams may not be nil if we are looking at a signature
 		// of a generic function type (or an interface method) that is
 		// part of the type we're testing. We don't care about these type
 		// parameters.
-		// Similarly, the receiver of a method may declare (rather then
+		// Similarly, the receiver of a method may declare (rather than
 		// use) type parameters, we don't care about those either.
 		// Thus, we only need to look at the input and result parameters.
 		return t.params != nil && w.varList(t.params.vars) || t.results != nil && w.varList(t.results.vars)
@@ -537,8 +627,7 @@ func (w *tpWalker) isParameterized(typ Type) (res bool) {
 		}
 
 	case *TypeParam:
-		// t must be one of w.tparams
-		return tparamIndex(w.tparams, t) >= 0
+		return slices.Index(w.tparams, t) >= 0
 
 	default:
 		panic(fmt.Sprintf("unexpected %T", typ))
@@ -613,12 +702,13 @@ type cycleFinder struct {
 }
 
 func (w *cycleFinder) typ(typ Type) {
+	typ = Unalias(typ)
 	if w.seen[typ] {
 		// We have seen typ before. If it is one of the type parameters
 		// in w.tparams, iterative substitution will lead to infinite expansion.
 		// Nil out the corresponding type which effectively kills the cycle.
 		if tpar, _ := typ.(*TypeParam); tpar != nil {
-			if i := tparamIndex(w.tparams, tpar); i >= 0 {
+			if i := slices.Index(w.tparams, tpar); i >= 0 {
 				// cycle through tpar
 				w.inferred[i] = nil
 			}
@@ -633,6 +723,9 @@ func (w *cycleFinder) typ(typ Type) {
 	switch t := typ.(type) {
 	case *Basic:
 		// nothing to do
+
+	// *Alias:
+	//      This case should not occur because of Unalias(typ) at the top.
 
 	case *Array:
 		w.typ(t.elem)
@@ -684,7 +777,7 @@ func (w *cycleFinder) typ(typ Type) {
 		}
 
 	case *TypeParam:
-		if i := tparamIndex(w.tparams, t); i >= 0 && w.inferred[i] != nil {
+		if i := slices.Index(w.tparams, t); i >= 0 && w.inferred[i] != nil {
 			w.typ(w.inferred[i])
 		}
 
@@ -697,15 +790,4 @@ func (w *cycleFinder) varList(list []*Var) {
 	for _, v := range list {
 		w.typ(v.typ)
 	}
-}
-
-// If tpar is a type parameter in list, tparamIndex returns the index
-// of the type parameter in list. Otherwise the result is < 0.
-func tparamIndex(list []*TypeParam, tpar *TypeParam) int {
-	for i, p := range list {
-		if p == tpar {
-			return i
-		}
-	}
-	return -1
 }

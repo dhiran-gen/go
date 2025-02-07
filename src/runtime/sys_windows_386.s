@@ -9,17 +9,26 @@
 
 // Offsets into Thread Environment Block (pointer in FS)
 #define TEB_TlsSlots 0xE10
+#define TEB_ArbitraryPtr 0x14
+
+TEXT runtime·asmstdcall_trampoline<ABIInternal>(SB),NOSPLIT,$0
+	JMP	runtime·asmstdcall(SB)
 
 // void runtime·asmstdcall(void *c);
 TEXT runtime·asmstdcall(SB),NOSPLIT,$0
 	MOVL	fn+0(FP), BX
+	MOVL	SP, BP	// save stack pointer
 
 	// SetLastError(0).
 	MOVL	$0, 0x34(FS)
 
+	MOVL	libcall_n(BX), CX
+
+	// Fast version, do not store args on the stack.
+	CMPL	CX, $0
+	JE	docall
+
 	// Copy args to the stack.
-	MOVL	SP, BP
-	MOVL	libcall_n(BX), CX	// words
 	MOVL	CX, AX
 	SALL	$2, AX
 	SUBL	AX, SP			// room for args
@@ -28,6 +37,7 @@ TEXT runtime·asmstdcall(SB),NOSPLIT,$0
 	CLD
 	REP; MOVSL
 
+docall:
 	// Call stdcall or cdecl function.
 	// DI SI BP BX are preserved, SP is not
 	CALL	libcall_fn(BX)
@@ -224,34 +234,7 @@ TEXT runtime·setldt(SB),NOSPLIT,$0-12
 	MOVL	DX, 0(CX)(FS)
 	RET
 
-// Runs on OS stack.
-// duration (in -100ns units) is in dt+0(FP).
-// g may be nil.
-TEXT runtime·usleep2(SB),NOSPLIT,$20-4
-	MOVL	dt+0(FP), BX
-	MOVL	$-1, hi-4(SP)
-	MOVL	BX, lo-8(SP)
-	LEAL	lo-8(SP), BX
-	MOVL	BX, ptime-12(SP)
-	MOVL	$0, alertable-16(SP)
-	MOVL	$-1, handle-20(SP)
-	MOVL	SP, BP
-	MOVL	runtime·_NtWaitForSingleObject(SB), AX
-	CALL	AX
-	MOVL	BP, SP
-	RET
-
-// Runs on OS stack.
-TEXT runtime·switchtothread(SB),NOSPLIT,$0
-	MOVL	SP, BP
-	MOVL	runtime·_SwitchToThread(SB), AX
-	CALL	AX
-	MOVL	BP, SP
-	RET
-
 TEXT runtime·nanotime1(SB),NOSPLIT,$0-8
-	CMPB	runtime·useQPCTime(SB), $0
-	JNE	useQPC
 loop:
 	MOVL	(_INTERRUPT_TIME+time_hi1), AX
 	MOVL	(_INTERRUPT_TIME+time_lo), CX
@@ -268,9 +251,6 @@ loop:
 	MOVL	AX, ret_lo+0(FP)
 	MOVL	DX, ret_hi+4(FP)
 	RET
-useQPC:
-	JMP	runtime·nanotimeQPC(SB)
-	RET
 
 // This is called from rt0_go, which runs on the system stack
 // using the initial stack allocated by the OS.
@@ -286,7 +266,10 @@ TEXT runtime·wintls(SB),NOSPLIT,$0
 	// Assert that slot is less than 64 so we can use _TEB->TlsSlots
 	CMPL	CX, $64
 	JB	ok
-	CALL	runtime·abort(SB)
+	// Fallback to the TEB arbitrary pointer.
+	// TODO: don't use the arbitrary pointer (see go.dev/issue/59824)
+	MOVL	$TEB_ArbitraryPtr, CX
+	JMP	settls
 ok:
 	// Convert the TLS index at CX into
 	// an offset from TEB_TlsSlots.
@@ -294,5 +277,6 @@ ok:
 
 	// Save offset from TLS into tls_g.
 	ADDL	$TEB_TlsSlots, CX
+settls:
 	MOVL	CX, runtime·tls_g(SB)
 	RET
